@@ -20,6 +20,11 @@ import * as path from "path";
 import * as fs from "fs";
 import * as cors from "cors";
 
+// Import Genkit flow - assuming build places it correctly relative to lib/index.js
+// Adjust path if necessary based on your build process
+import {detectHeaders, DetectHeadersInput, DetectHeadersOutput} from "../../src/ai/flows/detect-headers-flow";
+
+
 // Initialize CORS middleware with options allowing specific origins or all
 // In production, restrict this to your app's domain
 const corsHandler = cors({origin: true});
@@ -148,4 +153,40 @@ export const parseSheet = onRequest({memory: "512MiB", timeoutSeconds: 60}, (req
        req.pipe(busboy);
      }
   });
+});
+
+
+// New Function: detectHeaders
+export const detectHeaders = onRequest({memory: "512MiB", timeoutSeconds: 60}, (req, res) => {
+    corsHandler(req, res, async () => {
+        if (req.method !== "POST") {
+            res.status(405).send("Method Not Allowed");
+            return;
+        }
+
+        try {
+            const inputData = req.body as DetectHeadersInput;
+
+            // Basic validation
+            if (!inputData || !Array.isArray(inputData.headers) || inputData.headers.length === 0) {
+                logger.error("Invalid input: 'headers' array is required.", { body: req.body });
+                res.status(400).json({ error: "Invalid input: 'headers' array is required." });
+                return;
+            }
+
+             logger.info("Calling detectHeaders Genkit flow with headers:", inputData.headers);
+
+            // Call the Genkit flow
+            const result: DetectHeadersOutput = await detectHeaders(inputData);
+
+             logger.info("detectHeaders Genkit flow completed successfully.", { result });
+            res.status(200).json(result);
+
+        } catch (error: unknown) {
+             logger.error("Error calling detectHeaders Genkit flow:", error);
+             const errorMessage = error instanceof Error ? error.message : "Unknown AI processing error";
+             // Consider more specific error codes based on Genkit errors if possible
+             res.status(500).json({ error: `Failed to detect headers: ${errorMessage}` });
+        }
+    });
 });

@@ -1,3 +1,4 @@
+
 {
   "functions": [
     {
@@ -25,8 +26,12 @@
     ],
      "rewrites": [
       {
-        "source": "/api/**",
-        "function": "parseSheet" // Example rewrite if you want /api/parse path
+        "source": "/api/parseSheet", // Using specific API path
+        "function": "parseSheet"
+      },
+      {
+        "source": "/api/detectHeaders", // Using specific API path
+        "function": "detectHeaders"
       },
        {
          "source": "**",
