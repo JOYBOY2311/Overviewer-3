@@ -28,6 +28,15 @@ try {
     logger.info("Firebase Admin SDK initialized successfully.");
 } catch (error) {
     logger.error("Error initializing Firebase Admin SDK:", error);
+    // Depending on your setup, you might want to re-throw or handle differently
+    // If running locally with emulators, multiple initializations might happen,
+    // which can sometimes cause benign errors if not handled.
+    if (admin.apps.length === 0) {
+        // Rethrow only if no app was initialized at all
+        throw error;
+    } else {
+        logger.warn("Firebase Admin SDK might have been initialized already.");
+    }
 }
 const db = admin.firestore();
 // ------------------------------------
@@ -43,7 +52,7 @@ type ConfirmedHeaderMapping = {
     website: string | null;
 };
 
-// Define the structure for the result of processing a single row
+// Define the structure for the result of processing a single row (Updated for Phase 6)
 type ProcessedRowResult = {
     originalData: {
         companyName: string | null;
@@ -59,23 +68,27 @@ type ProcessedRowResult = {
     errorMessage?: string;
     fetchedData?: {
         summary?: string;
-        lastUpdated?: admin.firestore.Timestamp | string;
+        lastUpdated?: string; // ISO string
+        independenceCriteria?: "Yes" | "";
+        insufficientInfo?: "Yes" | "";
+        // Add other fields as needed
     };
     scrapingStatus?: 'Pending' | 'Scraping' | 'Success' | 'Failed_Scrape' | 'Failed_Error';
     scrapedText?: string | null;
     scrapingErrorMessage?: string;
-    // Phase 5 fields
     summarizationStatus?: 'Pending_Summary' | 'Summarizing' | 'Success_Summary' | 'Failed_Summary';
-    summary?: string;
-    independenceCriteria?: "Yes" | "";
-    insufficientInfo?: "Yes" | "";
+    summary?: string; // Top-level summary for consistency
+    independenceCriteria?: "Yes" | ""; // Top-level for consistency
+    insufficientInfo?: "Yes" | ""; // Top-level for consistency
     summarizationErrorMessage?: string;
+    saveStatus?: 'Pending_Save' | 'Saving' | 'Saved' | 'Failed_Save'; // Added for Phase 6
+    saveErrorMessage?: string; // Added for Phase 6
 };
 
 // --- Helper function for Manual CORS ---
 const setCorsHeaders = (req: Request, res: Response): void => {
     res.set("Access-Control-Allow-Origin", "*");
-    res.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS, POST, PUT");
+    res.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS, POST, PUT, DELETE"); // Allow PUT/DELETE if needed
     res.set("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
 };
 // --------------------------------------
@@ -118,11 +131,11 @@ export const parseSheet = onRequest({ memory: "512MiB", timeoutSeconds: 60 }, (r
                     if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
                         logger.warn("Reading file from disk as buffer was null or empty.");
                         fileBuffer = fs.readFileSync(uploadedFilePath);
-                         if (!fileBuffer || fileBuffer.length === 0) {
+                        if (!fileBuffer || fileBuffer.length === 0) {
                             throw new Error("File buffer is empty even after disk fallback.");
                         }
                     } else {
-                         throw new Error("No file uploaded or file buffer is empty.");
+                        throw new Error("No file uploaded or file buffer is empty.");
                     }
                 }
                 logger.info("Parsing workbook from buffer...");
@@ -151,15 +164,15 @@ export const parseSheet = onRequest({ memory: "512MiB", timeoutSeconds: 60 }, (r
         });
         busboy.on("error", (err: Error) => {
             logger.error("Busboy error:", err);
-             if (!res.headersSent) { setCorsHeaders(req, res); }
+            if (!res.headersSent) { setCorsHeaders(req, res); }
             res.status(500).json({ error: "Error processing form data." });
         });
         req.pipe(busboy);
     } catch(error) {
-         logger.error("Synchronous error in parseSheet:", error);
-         const errorMessage = error instanceof Error ? error.message : "Unknown error";
-          if (!res.headersSent) { setCorsHeaders(req, res); }
-         res.status(500).json({ error: `Failed to process request: ${errorMessage}` });
+        logger.error("Synchronous error in parseSheet:", error);
+        const errorMessage = error instanceof Error ? error.message : "Unknown error";
+        if (!res.headersSent) { setCorsHeaders(req, res); }
+        res.status(500).json({ error: `Failed to process request: ${errorMessage}` });
     }
 });
 
@@ -193,7 +206,7 @@ export const detectHeaders = onRequest({ memory: "512MiB", timeoutSeconds: 60 },
     } catch (error: unknown) {
         logger.error("Synchronous error in detectHeaders function:", error);
         const errorMessage = error instanceof Error ? error.message : "Unknown processing error";
-         if (!res.headersSent) { setCorsHeaders(req, res); }
+        if (!res.headersSent) { setCorsHeaders(req, res); }
         res.status(500).json({ error: `Failed to process request: ${errorMessage}` });
     }
 });
@@ -219,11 +232,11 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
             throw new Error("Invalid input: At least one confirmed header (name, country, website) is required.");
         }
         if (!Array.isArray(inputHeaders) || inputHeaders.length === 0) {
-             throw new Error("Invalid input: 'headers' array is required for index lookup.");
+            throw new Error("Invalid input: 'headers' array is required for index lookup.");
         }
         allHeaders = inputHeaders;
         logger.info(`Starting normalizeAndCheck for ${rows.length} rows.`);
-        const results: ProcessedRowResult[] = [];
+        const results: Omit<ProcessedRowResult, 'originalIndex'>[] = []; // Use Omit here, originalIndex added later
         const sixMonthsAgo = new Date();
         sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
         const getIndex = (headerName: string | null): number => {
@@ -244,6 +257,12 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
             let errorMessage: string | undefined = undefined;
             let scrapingStatus: ProcessedRowResult['scrapingStatus'] = 'Pending';
             let summarizationStatus: ProcessedRowResult['summarizationStatus'] = 'Pending_Summary';
+            let saveStatus: ProcessedRowResult['saveStatus'] = 'Pending_Save'; // Initial save status
+
+            // AI fields initialized
+            let summary: string | undefined = undefined;
+            let independenceCriteria: ProcessedRowResult['independenceCriteria'] = "";
+            let insufficientInfo: ProcessedRowResult['insufficientInfo'] = "";
 
             const originalCompanyName = nameIndex !== -1 ? String(row[nameIndex] ?? '') : null;
             const originalCountry = countryIndex !== -1 ? String(row[countryIndex] ?? '') : null;
@@ -259,7 +278,7 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
                     tempWebsite = tempWebsite.replace(/^www\./, '');
                     tempWebsite = tempWebsite.replace(/\/$/, '');
                     if (tempWebsite.includes('.') && !tempWebsite.includes(' ')) {
-                         normalizedWebsite = tempWebsite;
+                        normalizedWebsite = tempWebsite;
                     } else {
                         logger.warn(`Invalid website format skipped: ${originalWebsite}`);
                     }
@@ -269,11 +288,12 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
                     status = 'Error';
                     scrapingStatus = 'Failed_Error';
                     summarizationStatus = 'Failed_Summary';
+                    saveStatus = 'Failed_Save'; // Cannot save if basic normalization fails
                 }
             }
 
             if (status !== 'Error' && normalizedWebsite) {
-                 try {
+                try {
                     const companiesRef = db.collection('companies');
                     const query = companiesRef.where('website', '==', normalizedWebsite).limit(1);
                     const snapshot = await query.get();
@@ -285,29 +305,43 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
                             const lastUpdatedDate = lastUpdatedTimestamp.toDate();
                             if (lastUpdatedDate > sixMonthsAgo) {
                                 status = 'Fetched';
+                                // Populate fetchedData
                                 fetchedData = {
-                                    summary: docData.summary || null,
-                                    lastUpdated: lastUpdatedTimestamp,
+                                    summary: docData.summary || undefined,
+                                    lastUpdated: lastUpdatedTimestamp.toDate().toISOString(),
+                                    independenceCriteria: docData.independenceCriteria || "",
+                                    insufficientInfo: docData.insufficientInfo || "",
+                                    // Add other fields here if needed
                                 };
-                                scrapingStatus = undefined;
-                                summarizationStatus = undefined;
+                                // Populate top-level fields for consistency
+                                summary = docData.summary || undefined;
+                                independenceCriteria = docData.independenceCriteria || "";
+                                insufficientInfo = docData.insufficientInfo || "";
+
+                                scrapingStatus = undefined; // Not applicable
+                                summarizationStatus = undefined; // Not applicable
+                                saveStatus = 'Saved'; // Already saved (implicitly)
+
                                 logger.info(`Found recent data for website: ${normalizedWebsite}`);
                             } else {
                                 status = 'To Process';
                                 scrapingStatus = 'Pending';
                                 summarizationStatus = 'Pending_Summary';
+                                saveStatus = 'Pending_Save';
                                 logger.info(`Found old data for website: ${normalizedWebsite}, marking for reprocessing.`);
                             }
                         } else {
                             status = 'To Process';
                             scrapingStatus = 'Pending';
                             summarizationStatus = 'Pending_Summary';
+                            saveStatus = 'Pending_Save';
                             logger.warn(`Missing or invalid lastUpdated timestamp for website: ${normalizedWebsite}`);
                         }
                     } else {
                         status = 'To Process';
                         scrapingStatus = 'Pending';
                         summarizationStatus = 'Pending_Summary';
+                        saveStatus = 'Pending_Save';
                         logger.info(`No data found for website: ${normalizedWebsite}`);
                     }
                 } catch (dbError) {
@@ -316,17 +350,22 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
                     status = 'Error';
                     scrapingStatus = 'Failed_Error';
                     summarizationStatus = 'Failed_Summary';
+                    saveStatus = 'Failed_Save'; // Cannot save if DB check fails
                 }
             } else if (status !== 'Error' && !normalizedWebsite && originalWebsite) {
-                 errorMessage = `Invalid website format: ${originalWebsite}`;
-                 status = 'Error';
-                 scrapingStatus = 'Failed_Error';
-                 summarizationStatus = 'Failed_Summary';
+                // Website provided but was invalid format
+                errorMessage = `Invalid website format: ${originalWebsite}`;
+                status = 'Error';
+                scrapingStatus = 'Failed_Error';
+                summarizationStatus = 'Failed_Summary';
+                saveStatus = 'Failed_Save';
             } else if (status !== 'Error' && !normalizedWebsite) {
-                 status = 'To Process';
-                 scrapingStatus = undefined;
-                 summarizationStatus = undefined;
-                 logger.info("No website provided, skipping Firestore check and scraping.");
+                 // No website provided
+                status = 'To Process'; // Can still be 'To Process' for name/country, but not for web-based steps
+                scrapingStatus = undefined;
+                summarizationStatus = undefined;
+                saveStatus = undefined; // Cannot save without website
+                logger.info("No website provided, skipping Firestore check, scraping, summarization, and saving.");
             }
 
             results.push({
@@ -335,6 +374,10 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
                 status,
                 scrapingStatus,
                 summarizationStatus,
+                saveStatus, // Include save status
+                summary, // Include top-level summary
+                independenceCriteria, // Include top-level flag
+                insufficientInfo, // Include top-level flag
                 ...(errorMessage && { errorMessage }),
                 ...(fetchedData && { fetchedData }),
             });
@@ -367,7 +410,7 @@ async function scrapeSingleUrl(url: string): Promise<string | null> {
             let text = '';
             $('article').each((i, el) => { text += $(el).text() + '\n\n'; });
             if (text.length < 500) {
-                 $('main').each((i, el) => { text += $(el).text() + '\n\n'; });
+                $('main').each((i, el) => { text += $(el).text() + '\n\n'; });
             }
             if (text.trim().length < 500) {
                 logger.info(`Low text from article/main tags for ${url}, trying p tags.`);
@@ -412,28 +455,28 @@ export const scrapeWebsiteContent = onRequest({ memory: "1GiB", timeoutSeconds: 
         let errorMessage: string | undefined;
 
         try {
-             scrapedText = await scrapeSingleUrl(fullUrl);
-             if (!scrapedText || scrapedText.length < 1000) {
+            scrapedText = await scrapeSingleUrl(fullUrl);
+            if (!scrapedText || scrapedText.length < 1000) {
                 logger.info(`Main page scrape for ${websiteUrl} yielded little text, trying /about...`);
-                const aboutUrl = `${fullUrl}/about`;
+                const aboutUrl = `${fullUrl}/about`; // Consider also /about-us or other variants
                 const aboutText = await scrapeSingleUrl(aboutUrl);
                 if (aboutText) {
                     scrapedText = (scrapedText ? scrapedText + '\n\n--- About Page ---\n\n' : '') + aboutText;
                     logger.info(`Appended text from ${aboutUrl}`);
                 }
-             }
-             if (scrapedText && scrapedText.length > 0) {
-                 finalStatus = 'Success';
-                 const maxLength = 10000;
-                 if (scrapedText.length > maxLength) {
-                     scrapedText = scrapedText.substring(0, maxLength) + '... [truncated]';
-                     logger.info(`Truncated scraped text for ${websiteUrl} to ${maxLength} characters.`);
-                 }
-             } else {
-                 finalStatus = 'Failed_Scrape';
-                 errorMessage = `Scraping successful but yielded no significant content from ${websiteUrl} or its /about page.`;
-                 logger.warn(errorMessage);
-             }
+            }
+            if (scrapedText && scrapedText.length > 0) {
+                finalStatus = 'Success';
+                const maxLength = 10000; // Limit text length for LLM
+                if (scrapedText.length > maxLength) {
+                    scrapedText = scrapedText.substring(0, maxLength) + '... [truncated]';
+                    logger.info(`Truncated scraped text for ${websiteUrl} to ${maxLength} characters.`);
+                }
+            } else {
+                finalStatus = 'Failed_Scrape';
+                errorMessage = `Scraping successful but yielded no significant content from ${websiteUrl} or its /about page.`;
+                logger.warn(errorMessage);
+            }
         } catch (scrapeError: any) {
             logger.error(`Unexpected error during scraping process for ${websiteUrl}:`, scrapeError);
             finalStatus = 'Failed_Error';
@@ -487,5 +530,102 @@ export const processAndSummarizeContent = onRequest({ memory: "1GiB", timeoutSec
         const errorMessage = error instanceof Error ? error.message : "Unknown AI processing error";
         if (!res.headersSent) { setCorsHeaders(req, res); }
         res.status(500).json({ error: `Failed to summarize content: ${errorMessage}` });
+    }
+});
+
+// --- NEW FUNCTION FOR PHASE 6 ---
+interface SaveDataPayload {
+    originalData: { companyName: string | null; country: string | null; website: string | null };
+    normalizedData: { companyName: string | null; country: string | null; website: string | null };
+    summary?: string;
+    independenceCriteria?: "Yes" | "";
+    insufficientInfo?: "Yes" | "";
+    // Add any other fields needed from ProcessedRowResult
+}
+
+export const saveCompanyData = onRequest({ memory: "512MiB", timeoutSeconds: 60 }, async (req: Request, res: Response): Promise<void> => {
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") {
+        res.status(204).send(""); return;
+    }
+    if (req.method !== "POST") {
+        res.status(405).send("Method Not Allowed"); return;
+    }
+
+    try {
+        const input = req.body as SaveDataPayload;
+
+        // --- Input Validation ---
+        if (!input || typeof input !== 'object') {
+             logger.error("Invalid input: Missing request body.");
+             if (!res.headersSent) setCorsHeaders(req, res);
+             res.status(400).json({ error: "Invalid input: Missing request body.", success: false });
+             return;
+        }
+        if (!input.normalizedData || !input.normalizedData.website) {
+            logger.error("Invalid input: Missing normalized website.", { payload: input });
+             if (!res.headersSent) setCorsHeaders(req, res);
+            res.status(400).json({ error: "Invalid input: Normalized website is required to save data.", success: false });
+            return;
+        }
+        // Basic check for other potentially missing data, adjust as needed
+         if (!input.originalData) {
+             logger.warn("Input is missing originalData field.", { payload: input });
+             // Allow proceeding, but log it
+         }
+
+
+        const website = input.normalizedData.website; // Use normalized website as the key identifier
+
+        // --- Prepare Data for Firestore ---
+        const dataToSave: Record<string, any> = {
+            // Use normalized website as the primary key field in the document
+            website: website,
+            // Store original data for reference
+            originalCompanyName: input.originalData?.companyName ?? null,
+            originalCountry: input.originalData?.country ?? null,
+            originalWebsite: input.originalData?.website ?? null,
+             // Store normalized data
+            normalizedCompanyName: input.normalizedData.companyName ?? null,
+            normalizedCountry: input.normalizedData.country ?? null,
+             // Store AI results
+            summary: input.summary ?? null,
+            independenceCriteria: input.independenceCriteria ?? "",
+            insufficientInfo: input.insufficientInfo ?? "", // Field name from Genkit output
+            // Add timestamp
+            lastUpdated: admin.firestore.FieldValue.serverTimestamp(),
+            // Add other fields from payload if necessary
+        };
+
+        // Remove null/undefined values before saving? Optional, depends on preference.
+        // Object.keys(dataToSave).forEach(key => (dataToSave[key] === null || dataToSave[key] === undefined) && delete dataToSave[key]);
+
+
+        // --- Firestore Operation ---
+        logger.info(`Attempting to save data for website: ${website}`);
+        const companiesRef = db.collection('companies');
+        const query = companiesRef.where('website', '==', website).limit(1);
+        const snapshot = await query.get();
+
+        if (!snapshot.empty) {
+            // Document exists, update it
+            const docId = snapshot.docs[0].id;
+            await companiesRef.doc(docId).update(dataToSave);
+            logger.info(`Updated company data for website: ${website} (docId: ${docId})`);
+            if (!res.headersSent) setCorsHeaders(req, res);
+            res.status(200).json({ success: true, message: `Data updated for ${website}.` });
+        } else {
+            // Document does not exist, add it
+            const docRef = await companiesRef.add(dataToSave); // Use add for auto-generated ID
+            logger.info(`Added new company data for website: ${website} (new docId: ${docRef.id})`);
+            if (!res.headersSent) setCorsHeaders(req, res);
+            res.status(200).json({ success: true, message: `Data saved for new company ${website}.` });
+        }
+
+    } catch (error: unknown) {
+        logger.error(`Error saving company data for website "${(req.body as SaveDataPayload)?.normalizedData?.website}":`, error);
+        const message = error instanceof Error ? error.message : "Unknown error saving data.";
+        if (!res.headersSent) { setCorsHeaders(req, res); }
+        res.status(500).json({ error: `Failed to save data: ${message}`, success: false });
     }
 });

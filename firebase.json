@@ -1,4 +1,5 @@
 
+
 {
   "functions": [
     {
@@ -46,9 +47,14 @@
         "function": "processAndSummarizeContent"
       },
        {
+        "source": "/api/saveCompanyData",
+        "function": "saveCompanyData"
+       },
+       {
          "source": "**",
          "destination": "/index.html"
        }
     ]
   }
 }
+

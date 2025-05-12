@@ -3,7 +3,8 @@
 
 import type { ChangeEvent} from 'react';
 import { useState, useEffect } from 'react';
-import { Upload, Loader2, CheckCircle, XCircle, AlertCircle, FileCheck2, SearchCode, Bot, MessageSquareQuote, FileWarning, ShieldQuestion } from 'lucide-react'; // Added new icons
+import { Upload, Loader2, CheckCircle, XCircle, AlertCircle, FileCheck2, SearchCode, Bot, MessageSquareQuote, FileWarning, ShieldQuestion, Save, Download, DatabaseZap } from 'lucide-react'; // Added Save, Download, DatabaseZap icons
+import * as XLSX from 'xlsx'; // Import xlsx library for export
 
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
@@ -14,12 +15,12 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Progress } from '@/components/ui/progress';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Terminal } from "lucide-react";
-import { parseSheetFunctionUrl, detectHeadersFunctionUrl, normalizeAndCheckFunctionUrl, scrapeWebsiteContentFunctionUrl, processAndSummarizeContentFunctionUrl } from '@/lib/config'; // Added processAndSummarizeContentFunctionUrl
+import { parseSheetFunctionUrl, detectHeadersFunctionUrl, normalizeAndCheckFunctionUrl, scrapeWebsiteContentFunctionUrl, processAndSummarizeContentFunctionUrl, saveCompanyDataFunctionUrl } from '@/lib/config'; // Added saveCompanyDataFunctionUrl
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from '@/components/ui/separator';
 import { Skeleton } from '@/components/ui/skeleton';
 import type { DetectHeadersOutput } from '@/ai/flows/detect-headers-flow';
-import type { SummarizeContentOutput } from '@/ai/flows/summarize-content-flow'; // Import SummarizeContentOutput
+import type { SummarizeContentOutput } from '@/ai/flows/summarize-content-flow';
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import {
@@ -47,14 +48,21 @@ type ScrapeResult = {
     error?: string;
 };
 
+// Type definition for the response from saveCompanyData function
+type SaveResult = {
+    success: boolean;
+    message: string;
+    error?: string; // Added for more specific error handling
+};
 
-// Type for the result of processing a single row
+
+// Type for the result of processing a single row (Updated for Phase 6)
 type ProcessedRow = {
     originalData: {
         companyName: string | null;
         country: string | null;
         website: string | null;
-        [key: string]: string | number | boolean | Date | null;
+        [key: string]: string | number | boolean | Date | null; // Allow indexing original data
     };
     normalizedData: {
         companyName: string | null;
@@ -63,9 +71,11 @@ type ProcessedRow = {
     };
     status: 'Fetched' | 'To Process' | 'Error';
     errorMessage?: string;
-    fetchedData?: {
+    fetchedData?: { // Data exactly as fetched (for potential reference)
         summary?: string;
-        lastUpdated?: string;
+        lastUpdated?: string; // ISO String
+        independenceCriteria?: "Yes" | "";
+        insufficientInfo?: "Yes" | "";
     };
     originalIndex: number;
     // Phase 4 fields
@@ -74,10 +84,13 @@ type ProcessedRow = {
     scrapingErrorMessage?: string;
     // Phase 5 fields
     summarizationStatus?: 'Pending_Summary' | 'Summarizing' | 'Success_Summary' | 'Failed_Summary';
-    summary?: string;
-    independenceCriteria?: "Yes" | "";
-    insufficientInfo?: "Yes" | "";
+    summary?: string; // Top-level summary for display consistency
+    independenceCriteria?: "Yes" | ""; // Top-level for display consistency
+    insufficientInfo?: "Yes" | ""; // Top-level for display consistency
     summarizationErrorMessage?: string;
+    // Phase 6 fields
+    saveStatus?: 'Pending_Save' | 'Saving' | 'Saved' | 'Failed_Save';
+    saveErrorMessage?: string;
 };
 
 
@@ -109,16 +122,28 @@ export default function Home() {
 
   // --- Phase 4 State ---
   const [isScraping, setIsScraping] = useState<boolean>(false);
-  const [scrapingErrors, setScrapingErrors] = useState<Record<number, string | null>>({});
+  const [scrapingErrors, setScrapingErrors] = useState<Record<number, string | null>>({}); // Kept for potential direct error display if needed
 
   // --- Phase 5 State ---
   const [isSummarizingAny, setIsSummarizingAny] = useState<boolean>(false);
 
+  // --- Phase 6 State ---
+  const [isSavingAny, setIsSavingAny] = useState<boolean>(false);
+
 
   // --- Calculated State ---
-  const rowsToProcessCount = processedRows.filter(row => row.status === 'To Process' && row.scrapingStatus === 'Pending').length;
-  const rowsSuccessfullyScrapedCount = processedRows.filter(row => row.scrapingStatus === 'Success').length;
-  const rowsFailedScrapeCount = processedRows.filter(row => row.scrapingStatus === 'Failed_Scrape' || row.scrapingStatus === 'Failed_Error').length;
+  const rowsToProcessCount = processedRows.filter(row => row.status === 'To Process' && row.scrapingStatus === 'Pending' && row.normalizedData.website).length;
+  const rowsSuccessfullyProcessedCount = processedRows.filter(row => row.saveStatus === 'Saved').length;
+  const rowsFetchedCount = processedRows.filter(row => row.status === 'Fetched').length;
+  const rowsFailedCount = processedRows.filter(row =>
+        row.status === 'Error' ||
+        row.scrapingStatus === 'Failed_Scrape' ||
+        row.scrapingStatus === 'Failed_Error' ||
+        row.summarizationStatus === 'Failed_Summary' ||
+        row.saveStatus === 'Failed_Save'
+    ).length;
+  const totalRows = rawRows.length;
+  const canExport = processedRows.some(row => row.status === 'Fetched' || row.saveStatus === 'Saved');
 
 
   // --- Effects ---
@@ -140,10 +165,12 @@ export default function Home() {
     }
   }, [aiSuggestedHeaders]);
 
-  // Effect to manage isSummarizingAny based on processedRows
+  // Effect to manage isSummarizingAny and isSavingAny based on processedRows
   useEffect(() => {
     const anyRowSummarizing = processedRows.some(row => row.summarizationStatus === 'Summarizing');
+    const anyRowSaving = processedRows.some(row => row.saveStatus === 'Saving');
     setIsSummarizingAny(anyRowSummarizing);
+    setIsSavingAny(anyRowSaving);
   }, [processedRows]);
 
 
@@ -179,6 +206,7 @@ export default function Home() {
     const file = event.target.files?.[0];
     if (!file) return;
 
+    // Reset ALL relevant state
     setFileName(file.name);
     setRawHeaders([]);
     setRawRows([]);
@@ -196,7 +224,8 @@ export default function Home() {
     setPhase3Error(null);
     setIsScraping(false);
     setScrapingErrors({});
-    setIsSummarizingAny(false); // Reset summarization state
+    setIsSummarizingAny(false);
+    setIsSavingAny(false); // Reset saving state
 
     const formData = new FormData();
     formData.append('file', file);
@@ -264,6 +293,7 @@ export default function Home() {
     setIsScraping(false);
     setScrapingErrors({});
     setIsSummarizingAny(false);
+    setIsSavingAny(false); // Reset saving state
 
     try {
         const response = await fetch(normalizeAndCheckFunctionUrl, {
@@ -276,14 +306,15 @@ export default function Home() {
              try { const errorData = await response.json(); if (errorData.error) errorMsg += `: ${errorData.error}`; } catch (e) { /* ignore */ }
              throw new Error(errorMsg);
         }
-        const results: ProcessedRow[] = await response.json();
+        const results: Omit<ProcessedRow, 'originalIndex'>[] = await response.json(); // Backend returns without originalIndex initially
          const resultsWithInitialStatus = results.map((row, index) => ({
             ...row,
-            originalIndex: index,
-            scrapingStatus: row.scrapingStatus ?? (row.status === 'To Process' ? 'Pending' : undefined),
-            summarizationStatus: (row.status === 'To Process' && (row.scrapingStatus ?? 'Pending') === 'Pending' && row.normalizedData.website)
+            originalIndex: index, // Add original index here
+            scrapingStatus: row.scrapingStatus ?? (row.status === 'To Process' && row.normalizedData.website ? 'Pending' : undefined),
+            summarizationStatus: row.summarizationStatus ?? (row.status === 'To Process' && (row.scrapingStatus ?? 'Pending') === 'Pending' && row.normalizedData.website)
                                 ? 'Pending_Summary'
                                 : undefined,
+            saveStatus: row.saveStatus ?? (row.status === 'Fetched' ? 'Saved' : (row.status === 'To Process' && row.normalizedData.website ? 'Pending_Save' : undefined)),
          }));
         setProcessedRows(resultsWithInitialStatus);
     } catch (error) {
@@ -297,25 +328,26 @@ export default function Home() {
   const handleScraping = async () => {
     if (!processedRows.length) return;
 
-    const rowsToScrapeExist = processedRows.some(row => row.status === 'To Process' && row.scrapingStatus === 'Pending' && row.normalizedData.website);
-    if (rowsToScrapeExist) {
+    const rowsToScrape = processedRows.filter(row => row.status === 'To Process' && row.scrapingStatus === 'Pending' && row.normalizedData.website);
+
+    if (rowsToScrape.length > 0) {
         setIsScraping(true); // Set scraping active only if there are rows to scrape
-    }
-    // Set summarizing active if any of those scraped rows will then be summarized
-    const rowsThatWillBeSummarized = processedRows.some(
-        row => row.status === 'To Process' && row.scrapingStatus === 'Pending' && row.normalizedData.website
-    );
-    if (rowsThatWillBeSummarized) {
-        setIsSummarizingAny(true);
+    } else {
+        console.log("No rows pending scraping.");
+        return; // No need to proceed if nothing to scrape
     }
 
-
-    setScrapingErrors({});
     let updatedRows = [...processedRows];
 
-    const scrapingPromises = updatedRows.map(async (row, index) => {
+    // Process rows sequentially or in small batches to avoid overwhelming resources/APIs
+    for (let i = 0; i < updatedRows.length; i++) {
+        const row = updatedRows[i];
+
         if (row.status === 'To Process' && row.normalizedData.website && row.scrapingStatus === 'Pending') {
-            updatedRows[index] = { ...row, scrapingStatus: 'Scraping' };
+            const rowIndex = row.originalIndex; // Use originalIndex for mapping
+
+            // --- Start Scraping ---
+            updatedRows[rowIndex] = { ...row, scrapingStatus: 'Scraping', summarizationStatus: 'Pending_Summary', saveStatus: 'Pending_Save' };
             setProcessedRows([...updatedRows]);
 
             try {
@@ -328,91 +360,185 @@ export default function Home() {
                     }),
                 });
                 const scrapeResult: ScrapeResult = await scrapeResponse.json();
-                if (!scrapeResponse.ok) { // Check response.ok here for scrape
-                     updatedRows[index] = {
-                        ...updatedRows[index],
-                        scrapingStatus: scrapeResult.status || 'Failed_Error', // Use status from backend if available
-                        scrapingErrorMessage: scrapeResult.error || `Scraping failed (Status: ${scrapeResponse.status})`,
+
+                if (!scrapeResponse.ok || scrapeResult.status !== 'Success' || !scrapeResult.scrapedText) {
+                    const errMsg = scrapeResult.error || `Scraping failed (Status: ${scrapeResponse.status})` || 'No significant content found.';
+                    updatedRows[rowIndex] = {
+                        ...updatedRows[rowIndex],
+                        scrapingStatus: scrapeResult.status || 'Failed_Error',
+                        scrapingErrorMessage: errMsg,
                         summarizationStatus: 'Failed_Summary', // Fail summary if scrape fails
                         summarizationErrorMessage: 'Scraping failed, cannot summarize.',
-                     };
-                } else if (scrapeResult.status === 'Success' && scrapeResult.scrapedText) {
-                    updatedRows[index] = {
-                        ...updatedRows[index],
-                        scrapingStatus: 'Success',
-                        scrapedText: scrapeResult.scrapedText,
-                        summarizationStatus: 'Summarizing', // Set to summarizing
+                        saveStatus: 'Failed_Save', // Cannot save if scrape fails
+                        saveErrorMessage: 'Scraping failed, data not saved.',
                     };
-                    setProcessedRows([...updatedRows]); // Update UI to show 'Summarizing'
-
-                    // Now, call summarization
-                    try {
-                        const summarizeResponse = await fetch(processAndSummarizeContentFunctionUrl, {
-                            method: 'POST',
-                            headers: { 'Content-Type': 'application/json' },
-                            body: JSON.stringify({ scrapedText: scrapeResult.scrapedText }),
-                        });
-                        const summaryResult: SummarizeContentOutput = await summarizeResponse.json();
-
-                        if (!summarizeResponse.ok) { // Check response.ok for summarize
-                             updatedRows[index] = {
-                                ...updatedRows[index],
-                                summarizationStatus: 'Failed_Summary',
-                                summarizationErrorMessage: (summaryResult as any).error || `Summarization failed (Status: ${summarizeResponse.status})`,
-                             };
-                        } else {
-                             updatedRows[index] = {
-                                ...updatedRows[index],
-                                summarizationStatus: 'Success_Summary',
-                                summary: summaryResult.summary,
-                                independenceCriteria: summaryResult.independenceCriteria,
-                                insufficientInfo: summaryResult.insufficientInfo,
-                             };
-                        }
-                    } catch (summaryError) {
-                        const message = summaryError instanceof Error ? summaryError.message : "Unknown summarization error.";
-                        updatedRows[index] = {
-                            ...updatedRows[index],
-                            summarizationStatus: 'Failed_Summary',
-                            summarizationErrorMessage: message,
-                        };
-                    }
-                } else { // Scraping "succeeded" but no text or other fail status
-                    updatedRows[index] = {
-                        ...updatedRows[index],
-                        scrapingStatus: scrapeResult.status || 'Failed_Scrape',
-                        scrapedText: null,
-                        scrapingErrorMessage: scrapeResult.error || 'No significant content found.',
-                        summarizationStatus: 'Failed_Summary',
-                        summarizationErrorMessage: 'No content to summarize.',
-                    };
+                    setProcessedRows([...updatedRows]);
+                    continue; // Move to the next row
                 }
+
+                // --- Scraping Success, Start Summarization ---
+                 updatedRows[rowIndex] = {
+                    ...updatedRows[rowIndex],
+                    scrapingStatus: 'Success',
+                    scrapedText: scrapeResult.scrapedText,
+                    summarizationStatus: 'Summarizing',
+                 };
+                 setProcessedRows([...updatedRows]);
+
+                 try {
+                     const summarizeResponse = await fetch(processAndSummarizeContentFunctionUrl, {
+                         method: 'POST',
+                         headers: { 'Content-Type': 'application/json' },
+                         body: JSON.stringify({ scrapedText: scrapeResult.scrapedText }),
+                     });
+                     const summaryResult: SummarizeContentOutput & { error?: string } = await summarizeResponse.json(); // Allow error prop
+
+                     if (!summarizeResponse.ok || summaryResult.error) {
+                         const errMsg = summaryResult.error || `Summarization failed (Status: ${summarizeResponse.status})`;
+                         updatedRows[rowIndex] = {
+                             ...updatedRows[rowIndex],
+                             summarizationStatus: 'Failed_Summary',
+                             summarizationErrorMessage: errMsg,
+                             saveStatus: 'Failed_Save', // Cannot save if summary fails
+                             saveErrorMessage: 'Summarization failed, data not saved.',
+                         };
+                         setProcessedRows([...updatedRows]);
+                         continue; // Move to the next row
+                     }
+
+                     // --- Summarization Success, Start Saving ---
+                     updatedRows[rowIndex] = {
+                         ...updatedRows[rowIndex],
+                         summarizationStatus: 'Success_Summary',
+                         summary: summaryResult.summary,
+                         independenceCriteria: summaryResult.independenceCriteria,
+                         insufficientInfo: summaryResult.insufficientInfo,
+                         saveStatus: 'Saving', // Set to saving
+                     };
+                     setProcessedRows([...updatedRows]);
+
+                     try {
+                         const saveDataPayload = {
+                             originalData: row.originalData,
+                             normalizedData: row.normalizedData,
+                             summary: summaryResult.summary,
+                             independenceCriteria: summaryResult.independenceCriteria,
+                             insufficientInfo: summaryResult.insufficientInfo,
+                         };
+                         const saveResponse = await fetch(saveCompanyDataFunctionUrl, {
+                             method: 'POST',
+                             headers: { 'Content-Type': 'application/json' },
+                             body: JSON.stringify(saveDataPayload),
+                         });
+                         const saveResult: SaveResult = await saveResponse.json();
+
+                         if (!saveResponse.ok || !saveResult.success) {
+                            const errMsg = saveResult.error || saveResult.message || `Saving failed (Status: ${saveResponse.status})`;
+                             updatedRows[rowIndex] = {
+                                 ...updatedRows[rowIndex],
+                                 saveStatus: 'Failed_Save',
+                                 saveErrorMessage: errMsg,
+                             };
+                         } else {
+                             // --- Saving Success ---
+                             updatedRows[rowIndex] = {
+                                 ...updatedRows[rowIndex],
+                                 saveStatus: 'Saved',
+                             };
+                         }
+                     } catch (saveError) {
+                         const message = saveError instanceof Error ? saveError.message : "Unknown saving error.";
+                         updatedRows[rowIndex] = {
+                             ...updatedRows[rowIndex],
+                             saveStatus: 'Failed_Save',
+                             saveErrorMessage: message,
+                         };
+                     }
+
+                 } catch (summaryError) { // Catch for summarize fetch or initial processing
+                     const message = summaryError instanceof Error ? summaryError.message : "Unknown summarization error.";
+                     updatedRows[rowIndex] = {
+                         ...updatedRows[rowIndex],
+                         summarizationStatus: 'Failed_Summary',
+                         summarizationErrorMessage: message,
+                         saveStatus: 'Failed_Save', // Cannot save if summary fails
+                         saveErrorMessage: 'Summarization error, data not saved.',
+                     };
+                 }
+
             } catch (error) { // Catch for scrape fetch or initial processing
                 const message = error instanceof Error ? error.message : "Unknown scraping error.";
-                 updatedRows[index] = {
-                    ...updatedRows[index],
+                 updatedRows[rowIndex] = {
+                    ...updatedRows[rowIndex],
                     scrapingStatus: 'Failed_Error',
                     scrapedText: null,
                     scrapingErrorMessage: message,
                     summarizationStatus: 'Failed_Summary',
                     summarizationErrorMessage: 'Scraping error, cannot summarize.',
+                    saveStatus: 'Failed_Save',
+                    saveErrorMessage: 'Scraping error, data not saved.',
                  };
-                setScrapingErrors(prev => ({ ...prev, [row.originalIndex]: message }));
             } finally {
-                 setProcessedRows([...updatedRows]);
+                 setProcessedRows([...updatedRows]); // Update state after each row attempt
             }
         }
-        return;
-    });
+    }
 
-    await Promise.allSettled(scrapingPromises);
-    setIsScraping(false);
-    // isSummarizingAny will be updated by the useEffect hook
+    setIsScraping(false); // All rows attempted
+    // isSummarizingAny and isSavingAny will be updated by the useEffect hook based on row statuses
 };
+
+ const handleExportToXLSX = () => {
+        if (!canExport) return;
+
+        const rowsForExport = processedRows.filter(row =>
+            row.status === 'Fetched' ||
+            (row.status === 'To Process' && row.summarizationStatus === 'Success_Summary' && row.saveStatus === 'Saved')
+        );
+
+        if (rowsForExport.length === 0) {
+            console.warn("No rows are ready for export.");
+            // Optionally show a toast message to the user
+            return;
+        }
+
+        const dataToExport = rowsForExport.map(row => ({
+            "Original Company Name": row.originalData.companyName ?? "",
+            "Original Country": row.originalData.country ?? "",
+            "Original Website": row.originalData.website ?? "",
+            "Normalized Company Name": row.normalizedData.companyName ?? "",
+            "Normalized Country": row.normalizedData.country ?? "",
+            "Normalized Website": row.normalizedData.website ?? "",
+            "AI Summary": row.summary ?? (row.status === 'Fetched' ? "(Fetched from DB)" : ""),
+            "Independence Criteria": row.independenceCriteria === "Yes" ? "Yes" : "",
+            "Insufficient Info Flag": row.insufficientInfo === "Yes" ? "Yes" : "",
+            "Processing Status": row.status === 'Fetched' ? 'Fetched from DB' : 'Processed & Saved',
+            "Last Updated (DB)": row.fetchedData?.lastUpdated ? new Date(row.fetchedData.lastUpdated).toLocaleString() : (row.saveStatus === 'Saved' ? new Date().toLocaleString() : ""), // Indicate fetch/save time
+        }));
+
+        try {
+            const worksheet = XLSX.utils.json_to_sheet(dataToExport);
+            const workbook = XLSX.utils.book_new();
+            XLSX.utils.book_append_sheet(workbook, worksheet, "Overviewer Results");
+
+             // Set column widths (optional, requires more complex handling or a library extension)
+            // worksheet['!cols'] = [ {wch:30}, {wch:15}, {wch:30}, {wch:30}, {wch:15}, {wch:30}, {wch:50}, {wch:10}, {wch:10}, {wch:20}, {wch:20} ];
+
+
+            XLSX.writeFile(workbook, "Overviewer_Results.xlsx");
+        } catch (error) {
+            console.error("Error exporting to XLSX:", error);
+            // Optionally show an error toast message
+        }
+    };
 
 
   // --- Rendering Logic ---
    const renderCellContent = (cellData: string | number | boolean | Date | null): React.ReactNode => {
+    // Render dates nicely if they are Date objects (Excel might parse some as dates)
+    if (cellData instanceof Date) {
+      return cellData.toLocaleDateString();
+    }
     return cellData !== null && cellData !== undefined ? String(cellData) : '';
   };
 
@@ -432,6 +558,7 @@ export default function Home() {
   const renderHeaderSelector = (label: string, mappingKey: HeaderMappingKey) => {
     const aiSuggestion = aiSuggestedHeaders?.[mappingKey] ?? null;
     const currentValue = manualHeaderSelection[mappingKey] ?? "";
+    const isDisabled = !rawHeaders.length || isDetectingHeaders || isProcessingPhase3 || isScraping || isSummarizingAny || isSavingAny;
     return (
         <div className="grid grid-cols-3 items-center gap-4">
             <Label htmlFor={`select-${mappingKey}`} className="text-right font-medium">{label}:</Label>
@@ -439,7 +566,7 @@ export default function Home() {
                  <Select
                     value={currentValue}
                     onValueChange={(value) => handleManualHeaderChange(mappingKey, value)}
-                    disabled={!rawHeaders.length || isDetectingHeaders || isProcessingPhase3 || isScraping || isSummarizingAny}
+                    disabled={isDisabled}
                 >
                     <SelectTrigger id={`select-${mappingKey}`} className="w-full">
                         <SelectValue placeholder="Select Header..." />
@@ -481,7 +608,6 @@ export default function Home() {
      if (!row.scrapingStatus || row.status === 'Fetched' || (row.status === 'Error' && !row.scrapingErrorMessage)) {
          return <span className="text-xs text-muted-foreground italic">N/A</span>;
      }
-     const error = scrapingErrors[row.originalIndex];
      switch (row.scrapingStatus) {
          case 'Pending': return <Badge variant="outline">Pending Scrape</Badge>;
          case 'Scraping': return <Badge variant="secondary" className="animate-pulse"><Loader2 className="mr-1 h-3 w-3 animate-spin" />Scraping...</Badge>;
@@ -494,7 +620,7 @@ export default function Home() {
          case 'Failed_Scrape': case 'Failed_Error':
              return (
                  <TooltipProvider>
-                     <Tooltip><TooltipTrigger asChild><Badge variant="destructive" className="cursor-help"><XCircle className="mr-1 h-3 w-3" /> Failed</Badge></TooltipTrigger><TooltipContent><p className="max-w-xs text-xs">{row.scrapingErrorMessage || error || 'Scraping failed.'}</p></TooltipContent></Tooltip>
+                     <Tooltip><TooltipTrigger asChild><Badge variant="destructive" className="cursor-help"><XCircle className="mr-1 h-3 w-3" /> Failed</Badge></TooltipTrigger><TooltipContent><p className="max-w-xs text-xs">{row.scrapingErrorMessage || 'Scraping failed.'}</p></TooltipContent></Tooltip>
                  </TooltipProvider>
              );
          default: return <Badge variant="secondary">Unknown</Badge>;
@@ -502,9 +628,11 @@ export default function Home() {
  };
 
  const renderSummarizationStatus = (row: ProcessedRow) => {
-    if (!row.summarizationStatus || row.scrapingStatus !== 'Success' ) {
+    if (!row.summarizationStatus || row.scrapingStatus !== 'Success') {
          if (row.status === 'Fetched' || (row.status === 'Error' && !row.summarizationErrorMessage)) return <span className="text-xs text-muted-foreground italic">N/A</span>;
          if (row.scrapingStatus === 'Failed_Error' || row.scrapingStatus === 'Failed_Scrape') return <Badge variant="outline" className="border-orange-400 text-orange-700 dark:border-orange-600 dark:text-orange-400">Not Summarized</Badge>;
+         // Default for rows without scraping but maybe other errors
+         return <span className="text-xs text-muted-foreground italic">N/A</span>;
     }
 
      switch (row.summarizationStatus) {
@@ -542,6 +670,40 @@ export default function Home() {
      }
  };
 
+ const renderSaveStatus = (row: ProcessedRow) => {
+     if (row.status === 'Error') return <Badge variant="destructive">Not Saved</Badge>;
+     if (!row.saveStatus || (row.status !== 'Fetched' && row.summarizationStatus !== 'Success_Summary')) {
+         return <span className="text-xs text-muted-foreground italic">N/A</span>;
+     }
+
+     switch (row.saveStatus) {
+         case 'Pending_Save': return <Badge variant="outline">Pending Save</Badge>;
+         case 'Saving': return <Badge variant="secondary" className="animate-pulse"><Loader2 className="mr-1 h-3 w-3 animate-spin" />Saving...</Badge>;
+         case 'Saved':
+             return (
+                 <TooltipProvider>
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                           <Badge variant="secondary" className="bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-300 cursor-help"><DatabaseZap className="mr-1 h-3 w-3" /> {row.status === 'Fetched' ? 'In Sync' : 'Saved'}</Badge>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                            <p className="text-xs">{row.status === 'Fetched' ? `Data fetched from DB on ${new Date(row.fetchedData?.lastUpdated || Date.now()).toLocaleDateString()}` : `Data saved to DB.`}</p>
+                        </TooltipContent>
+                      </Tooltip>
+                 </TooltipProvider>
+             );
+         case 'Failed_Save':
+             return (
+                 <TooltipProvider>
+                     <Tooltip><TooltipTrigger asChild><Badge variant="destructive" className="cursor-help"><XCircle className="mr-1 h-3 w-3" /> Failed Save</Badge></TooltipTrigger><TooltipContent><p className="max-w-xs text-xs">{row.saveErrorMessage || 'Saving failed.'}</p></TooltipContent></Tooltip>
+                 </TooltipProvider>
+             );
+         default: return <span className="text-xs text-muted-foreground italic">N/A</span>;
+     }
+ }
+
+ const anyProcessRunning = isParsing || isDetectingHeaders || isProcessingPhase3 || isScraping || isSummarizingAny || isSavingAny;
+
 
   return (
     <main className="flex min-h-screen flex-col items-center p-6 md:p-12 lg:p-24 bg-background">
@@ -550,14 +712,20 @@ export default function Home() {
         <Card className="shadow-md">
           <CardHeader>
             <CardTitle className="text-2xl font-semibold">Overviewer 3</CardTitle>
-            <CardDescription>Upload an XLSX file, confirm headers, process, scrape, and summarize company data.</CardDescription>
+            <CardDescription>Upload, analyze, scrape, summarize, save, and export company data from XLSX files.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            <div className="space-y-2">
-               <Label htmlFor="file-upload" className={`file-input-label ${isParsing || isProcessingPhase3 || isScraping || isSummarizingAny ? 'opacity-50 cursor-not-allowed' : ''}`}>
-                <Upload className="mr-2 h-4 w-4" /> {fileName || 'Choose XLSX File'}
-              </Label>
-              <Input id="file-upload" type="file" accept=".xlsx" onChange={handleFileUpload} className="file-input" disabled={isParsing || isProcessingPhase3 || isScraping || isSummarizingAny} />
+            <div className="flex flex-wrap items-center gap-4">
+                 <Label htmlFor="file-upload" className={`file-input-label ${anyProcessRunning ? 'opacity-50 cursor-not-allowed' : ''}`}>
+                    <Upload className="mr-2 h-4 w-4" /> {fileName || 'Choose XLSX File'}
+                </Label>
+                <Input id="file-upload" type="file" accept=".xlsx" onChange={handleFileUpload} className="file-input" disabled={anyProcessRunning} />
+
+                 {canExport && (
+                     <Button onClick={handleExportToXLSX} variant="outline" disabled={anyProcessRunning}>
+                         <Download className="mr-2 h-4 w-4" /> Export Results
+                     </Button>
+                 )}
             </div>
              {isParsing && (<div className="space-y-2"><Progress value={uploadProgress} className="w-full" /><p className="text-sm text-muted-foreground text-center">{uploadProgress > 0 && uploadProgress < 100 ? `${uploadProgress}% Uploaded` : "Processing file..."}</p></div>)}
             {parseError && (<Alert variant="destructive"><Terminal className="h-4 w-4" /><AlertTitle>Parsing Error</AlertTitle><AlertDescription>{parseError}</AlertDescription></Alert>)}
@@ -577,7 +745,7 @@ export default function Home() {
                              {renderHeaderSelector("Website URL", "websiteHeader")}
                               <Separator />
                               <div className="flex justify-end">
-                                 <Button onClick={handleConfirmHeaders} disabled={isDetectingHeaders || isProcessingPhase3 || isScraping || isSummarizingAny}>
+                                 <Button onClick={handleConfirmHeaders} disabled={anyProcessRunning}>
                                      <CheckCircle className="mr-2 h-4 w-4" /> Confirm & Process
                                  </Button>
                              </div>
@@ -599,21 +767,24 @@ export default function Home() {
 
          {confirmedHeaders && !isProcessingPhase3 && !phase3Error && rowsToProcessCount > 0 && (
              <Card className="shadow-md">
-                 <CardHeader><CardTitle>Web Scraping & Summarization</CardTitle><CardDescription>{rowsToProcessCount} {rowsToProcessCount === 1 ? 'row needs' : 'rows need'} web content scraping and AI summarization.</CardDescription></CardHeader>
-                 <CardContent><p className="text-sm text-muted-foreground mb-4">Click to attempt scraping & summarizing for rows marked 'To Process'. This may take time.</p></CardContent>
+                 <CardHeader><CardTitle>Web Scraping, Summarization & Saving</CardTitle><CardDescription>{rowsToProcessCount} {rowsToProcessCount === 1 ? 'row needs' : 'rows need'} web content processing and saving.</CardDescription></CardHeader>
+                 <CardContent><p className="text-sm text-muted-foreground mb-4">Click to attempt scraping, summarizing, and saving for rows marked 'To Process'. This may take time.</p></CardContent>
                  <CardFooter className="flex justify-end">
-                     <Button onClick={handleScraping} disabled={isScraping || isProcessingPhase3 || isSummarizingAny}>
-                         {(isScraping || isSummarizingAny) ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <SearchCode className="mr-2 h-4 w-4" />}
-                         {(isScraping || isSummarizingAny) ? 'Processing Web Content...' : `Start Scraping & Summarizing (${rowsToProcessCount})`}
+                     <Button onClick={handleScraping} disabled={anyProcessRunning}>
+                         {(isScraping || isSummarizingAny || isSavingAny) ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <SearchCode className="mr-2 h-4 w-4" />}
+                         {(isScraping || isSummarizingAny || isSavingAny) ? 'Processing Web Content...' : `Start Web Processing (${rowsToProcessCount})`}
                      </Button>
                  </CardFooter>
              </Card>
          )}
-         {confirmedHeaders && !isProcessingPhase3 && processedRows.length > 0 && (rowsSuccessfullyScrapedCount > 0 || rowsFailedScrapeCount > 0) && (
+         {confirmedHeaders && !isProcessingPhase3 && processedRows.length > 0 && totalRows > 0 && (
             <Alert variant="default" className="mt-4">
-                 <Bot className="h-4 w-4" /><AlertTitle>Processing Summary</AlertTitle>
-                 <AlertDescription>Successfully scraped: {rowsSuccessfullyScrapedCount} | Failed to scrape: {rowsFailedScrapeCount}</AlertDescription>
-                 <AlertDescription>Summarized: {processedRows.filter(r => r.summarizationStatus === 'Success_Summary').length} | Failed to summarize: {processedRows.filter(r => r.summarizationStatus === 'Failed_Summary').length}</AlertDescription>
+                 <Bot className="h-4 w-4" /><AlertTitle>Processing Overview ({totalRows} total rows)</AlertTitle>
+                 <AlertDescription>
+                    <span className="mr-4">Fetched from DB: {rowsFetchedCount}</span>
+                    <span className="mr-4">Processed & Saved: {rowsSuccessfullyProcessedCount}</span>
+                    <span>Failed/Errors: {rowsFailedCount}</span>
+                 </AlertDescription>
              </Alert>
          )}
 
@@ -622,7 +793,7 @@ export default function Home() {
             <CardHeader>
               <CardTitle>File Contents: {fileName}</CardTitle>
               <CardDescription>
-                {confirmedHeaders ? `Displaying ${processedRows.length > 0 ? processedRows.length : rawRows.length} rows with processing, scraping & summarization status.` : (aiSuggestedHeaders ? "Highlighting suggested columns. Confirm above." : "Awaiting header confirmation.")}
+                {confirmedHeaders ? `Displaying ${totalRows} rows with processing status.` : (aiSuggestedHeaders ? "Highlighting suggested columns. Confirm above." : "Awaiting header confirmation.")}
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -632,41 +803,63 @@ export default function Home() {
                     <TableRow>
                        {confirmedHeaders && (
                            <>
-                            <TableHead className="font-bold w-[130px] sticky left-0 bg-card z-20">Status</TableHead>
-                            <TableHead className="font-bold w-[130px]">Scraping</TableHead>
-                            <TableHead className="font-bold w-[150px]">AI Summary</TableHead> {/* New Column */}
+                            <TableHead className="font-bold w-[120px] sticky left-0 bg-card z-20 border-r">Status</TableHead>
+                            <TableHead className="font-bold w-[120px]">Scraping</TableHead>
+                            <TableHead className="font-bold w-[150px]">AI Summary</TableHead>
+                            <TableHead className="font-bold w-[120px]">Save Status</TableHead>
                            </>
                        )}
                        {rawHeaders.map((header, index) => (<TableHead key={`${header}-${index}`} className={cn("font-semibold whitespace-nowrap", getHighlightClass(header))}>{header}</TableHead>))}
                     </TableRow>
                   </TableHeader>
                   <TableBody>
-                     {(processedRows.length > 0 ? processedRows : rawRows).map((item, rowIndex) => {
-                         const isProcessed = (item as ProcessedRow).originalIndex !== undefined;
-                         const rowData = isProcessed ? rawRows[(item as ProcessedRow).originalIndex] : item as ExcelRow;
-                         const processedInfo = isProcessed ? (item as ProcessedRow) : null;
-                         return (
-                              <TableRow key={processedInfo?.originalIndex ?? rowIndex} className={cn(processedInfo?.status === 'Fetched' ? 'opacity-70' : '', (processedInfo?.scrapingStatus === 'Scraping' || processedInfo?.summarizationStatus === 'Summarizing') ? 'animate-pulse bg-muted/50' : '')}>
+                     {processedRows.length > 0
+                        ? processedRows.map((processedInfo) => {
+                           const rowData = rawRows[processedInfo.originalIndex]; // Get original data using index
+                           return (
+                               <TableRow key={processedInfo.originalIndex} className={cn(processedInfo.status === 'Fetched' ? 'opacity-70' : '', (processedInfo.scrapingStatus === 'Scraping' || processedInfo.summarizationStatus === 'Summarizing' || processedInfo.saveStatus === 'Saving') ? 'animate-pulse bg-muted/50' : '')}>
                                 {confirmedHeaders && (
                                      <>
                                      <TableCell className="font-medium align-top sticky left-0 bg-card z-20 border-r">
-                                        {processedInfo ? (<div className="flex flex-col items-start gap-1 w-[110px]">{renderStatusBadge(processedInfo.status)} {processedInfo.status === 'Fetched' && processedInfo.fetchedData?.summary && (<Tooltip><TooltipTrigger asChild><span className="text-xs text-muted-foreground truncate cursor-help">Summary: {processedInfo.fetchedData.summary}</span></TooltipTrigger><TooltipContent><p className="max-w-xs text-xs">{processedInfo.fetchedData.summary}</p></TooltipContent></Tooltip>)} {processedInfo.status === 'Error' && processedInfo.errorMessage && (<Tooltip><TooltipTrigger asChild><span className="text-xs text-destructive truncate cursor-help">{processedInfo.errorMessage}</span></TooltipTrigger><TooltipContent><p className="max-w-xs text-xs">{processedInfo.errorMessage}</p></TooltipContent></Tooltip>)}</div>) : isProcessingPhase3 ? (<Skeleton className="h-5 w-20" />) : (<Badge variant="outline">Pending</Badge>)}
+                                        <div className="flex flex-col items-start gap-1 w-[100px]">
+                                            {renderStatusBadge(processedInfo.status)}
+                                            {processedInfo.status === 'Error' && processedInfo.errorMessage && (
+                                                <Tooltip><TooltipTrigger asChild><span className="text-xs text-destructive truncate cursor-help">{processedInfo.errorMessage}</span></TooltipTrigger><TooltipContent><p className="max-w-xs text-xs">{processedInfo.errorMessage}</p></TooltipContent></Tooltip>
+                                            )}
+                                        </div>
                                      </TableCell>
-                                     <TableCell className="font-medium align-top">
-                                         {processedInfo ? (<div className="w-[110px]">{renderScrapingStatus(processedInfo)}</div>) : isProcessingPhase3 ? (<Skeleton className="h-5 w-20" />) : (<span className="text-xs text-muted-foreground italic">N/A</span>)}
+                                     <TableCell className="font-medium align-top w-[100px]">
+                                         {renderScrapingStatus(processedInfo)}
                                      </TableCell>
-                                     <TableCell className="font-medium align-top"> {/* New Cell */}
-                                         {processedInfo ? (<div className="w-[130px]">{renderSummarizationStatus(processedInfo)}</div>) : (isProcessingPhase3 || isScraping || isSummarizingAny) ? (<Skeleton className="h-5 w-24" />) : (<span className="text-xs text-muted-foreground italic">N/A</span>)}
+                                     <TableCell className="font-medium align-top w-[130px]">
+                                         {renderSummarizationStatus(processedInfo)}
+                                     </TableCell>
+                                     <TableCell className="font-medium align-top w-[100px]">
+                                         {renderSaveStatus(processedInfo)}
                                      </TableCell>
                                      </>
                                  )}
                                  {rawHeaders.map((header, cellIndex) => (<TableCell key={`${header}-${cellIndex}`} className={cn("whitespace-normal break-words align-top", getHighlightClass(header))}>{renderCellContent(rowData[cellIndex] !== undefined ? rowData[cellIndex] : null)}</TableCell>))}
                               </TableRow>
-                         );
-                     })}
-                     {isProcessingPhase3 && processedRows.length === 0 && rawRows.slice(0, 5).map((_, idx) => (
+                           );
+                         })
+                        : rawRows.map((rowData, rowIndex) => ( // Fallback for initial display before processing
+                            <TableRow key={`raw-${rowIndex}`}>
+                                {confirmedHeaders && (
+                                    <>
+                                        <TableCell className="font-medium align-top sticky left-0 bg-card z-20 border-r">{isProcessingPhase3 ? <Skeleton className="h-5 w-20" /> : <Badge variant="outline">Pending</Badge>}</TableCell>
+                                        <TableCell className="font-medium align-top">{isProcessingPhase3 ? <Skeleton className="h-5 w-20" /> : <span className="text-xs text-muted-foreground italic">N/A</span>}</TableCell>
+                                        <TableCell className="font-medium align-top">{isProcessingPhase3 ? <Skeleton className="h-5 w-24" /> : <span className="text-xs text-muted-foreground italic">N/A</span>}</TableCell>
+                                        <TableCell className="font-medium align-top">{isProcessingPhase3 ? <Skeleton className="h-5 w-20" /> : <span className="text-xs text-muted-foreground italic">N/A</span>}</TableCell>
+                                    </>
+                                )}
+                                {rawHeaders.map((header, cellIndex) => (<TableCell key={`${header}-${cellIndex}`} className={cn("whitespace-normal break-words align-top", getHighlightClass(header))}>{renderCellContent(rowData[cellIndex] !== undefined ? rowData[cellIndex] : null)}</TableCell>))}
+                            </TableRow>
+                        ))
+                     }
+                     {isProcessingPhase3 && processedRows.length === 0 && rawRows.slice(0, 5).map((_, idx) => ( // Skeleton rows during Phase 3 loading
                          <TableRow key={`skeleton-${idx}`}>
-                             {confirmedHeaders && (<><TableCell><Skeleton className="h-5 w-20" /></TableCell><TableCell><Skeleton className="h-5 w-20" /></TableCell><TableCell><Skeleton className="h-5 w-24" /></TableCell></>)}
+                             {confirmedHeaders && (<><TableCell className="sticky left-0 bg-card z-20 border-r"><Skeleton className="h-5 w-20" /></TableCell><TableCell><Skeleton className="h-5 w-20" /></TableCell><TableCell><Skeleton className="h-5 w-24" /></TableCell><TableCell><Skeleton className="h-5 w-20" /></TableCell></>)}
                              {rawHeaders.map((h, hIdx) => <TableCell key={`sk-cell-${hIdx}`}><Skeleton className="h-5 w-full" /></TableCell>)}
                          </TableRow>
                      ))}
