@@ -1,0 +1,25 @@
+# Node Modules
+node_modules
+
+# Build Folder
+lib
+
+# Runtime Files
+*.log
+*.pid
+*.seed
+*.dump
+*.out
+
+# IDE/Editor Files
+.idea
+.vscode
+*.swp
+*~
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# Firebase Emulator Data
+*.sqlite
