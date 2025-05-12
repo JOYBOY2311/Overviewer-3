@@ -6,10 +6,12 @@
 // export const parseSheetFunctionUrl = "http://127.0.0.1:5001/your-project-id/us-central1/parseSheet";
 // export const detectHeadersFunctionUrl = "http://127.0.0.1:5001/your-project-id/us-central1/detectHeaders";
 // export const normalizeAndCheckFunctionUrl = "http://127.0.0.1:5001/your-project-id/us-central1/normalizeAndCheck";
+// export const scrapeWebsiteContentFunctionUrl = "http://127.0.0.1:5001/your-project-id/us-central1/scrapeWebsiteContent";
 // For production, they will look like:
 // export const parseSheetFunctionUrl = "https://us-central1-your-project-id.cloudfunctions.net/parseSheet";
 // export const detectHeadersFunctionUrl = "https://us-central1-your-project-id.cloudfunctions.net/detectHeaders";
 // export const normalizeAndCheckFunctionUrl = "https://us-central1-your-project-id.cloudfunctions.net/normalizeAndCheck";
+// export const scrapeWebsiteContentFunctionUrl = "https://us-central1-your-project-id.cloudfunctions.net/scrapeWebsiteContent";
 
 
 // --- PARSE SHEET FUNCTION ---
@@ -34,4 +36,12 @@ export const normalizeAndCheckFunctionUrl = process.env.NEXT_PUBLIC_NORMALIZE_CH
 
 if (normalizeAndCheckFunctionUrl.includes('your-project-id') || normalizeAndCheckFunctionUrl.includes('REPLACE')) {
     console.warn("Firebase Function URL (normalizeAndCheck) in src/lib/config.ts needs to be updated with your actual function URL or NEXT_PUBLIC_NORMALIZE_CHECK_URL environment variable.");
+}
+
+// --- SCRAPE WEBSITE CONTENT FUNCTION ---
+// Using a placeholder - **REPLACE THIS**
+export const scrapeWebsiteContentFunctionUrl = process.env.NEXT_PUBLIC_SCRAPE_CONTENT_URL || "https://us-central1-your-project-id.cloudfunctions.net/scrapeWebsiteContent"; // REPLACE_WITH_YOUR_FUNCTION_URL
+
+if (scrapeWebsiteContentFunctionUrl.includes('your-project-id') || scrapeWebsiteContentFunctionUrl.includes('REPLACE')) {
+    console.warn("Firebase Function URL (scrapeWebsiteContent) in src/lib/config.ts needs to be updated with your actual function URL or NEXT_PUBLIC_SCRAPE_CONTENT_URL environment variable.");
 }

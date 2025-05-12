@@ -14,6 +14,9 @@ import * as os from "os";
 import * as path from "path";
 import * as fs from "fs";
 import * as admin from 'firebase-admin'; // Added Firebase Admin SDK
+import axios from 'axios'; // Added Axios for scraping
+import * as cheerio from 'cheerio'; // Added Cheerio for scraping
+
 
 // Import Genkit flow - Renamed import, REMOVED DetectHeadersOutput type import
 import { detectHeaders as detectHeadersFlow, DetectHeadersInput, DetectHeadersOutput } from "../../src/ai/flows/detect-headers-flow"; // Assuming path is resolved
@@ -43,7 +46,7 @@ type ConfirmedHeaderMapping = {
     website: string | null;
 };
 
-// Define the structure for the result of processing a single row in Phase 3
+// Define the structure for the result of processing a single row in Phase 3 & 4
 type ProcessedRowResult = {
     originalData: {
         companyName: string | null;
@@ -57,12 +60,16 @@ type ProcessedRowResult = {
         website: string | null;
     };
     status: 'Fetched' | 'To Process' | 'Error';
-    errorMessage?: string; // Optional error message for this row
+    errorMessage?: string; // Optional error message for this row (from normalization/Firestore check)
     fetchedData?: { // Optional data fetched from Firestore
         summary?: string; // Example field, adjust as needed
-        lastUpdated?: Date;
+        lastUpdated?: admin.firestore.Timestamp | string; // Keep timestamp for server logic, string for client
         // Add other relevant fields from Firestore doc
     };
+    // Added for Phase 4
+    scrapingStatus?: 'Pending' | 'Scraping' | 'Success' | 'Failed_Scrape' | 'Failed_Error';
+    scrapedText?: string | null;
+    scrapingErrorMessage?: string; // Specific error message for scraping
 };
 
 // --- Helper function for Manual CORS ---
@@ -274,6 +281,7 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
             let status: 'Fetched' | 'To Process' | 'Error' = 'To Process';
             let fetchedData: ProcessedRowResult['fetchedData'] | undefined = undefined;
             let errorMessage: string | undefined = undefined;
+            let scrapingStatus: ProcessedRowResult['scrapingStatus'] = 'Pending'; // Initialize scraping status
 
             // Extract Original Data (handle potential index errors)
             const originalCompanyName = nameIndex !== -1 ? String(row[nameIndex] ?? '') : null;
@@ -302,6 +310,7 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
                     logger.error(`Error normalizing website "${originalWebsite}":`, normError);
                     errorMessage = `Error normalizing website: ${originalWebsite}`;
                     status = 'Error';
+                    scrapingStatus = 'Failed_Error'; // Cannot scrape if normalization failed
                 }
             }
 
@@ -317,39 +326,51 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
                         const docData = doc.data();
 
                         if (docData.lastUpdated && docData.lastUpdated instanceof admin.firestore.Timestamp) {
-                            const lastUpdatedDate = docData.lastUpdated.toDate();
+                            const lastUpdatedTimestamp = docData.lastUpdated; // Keep as Timestamp
+                            const lastUpdatedDate = lastUpdatedTimestamp.toDate();
                             if (lastUpdatedDate > sixMonthsAgo) {
                                 status = 'Fetched';
                                 fetchedData = {
                                     summary: docData.summary || null, // Adjust field names as needed
-                                    lastUpdated: lastUpdatedDate,
+                                    lastUpdated: lastUpdatedTimestamp, // Keep as Timestamp for server
                                     // Add other relevant fields
                                 };
+                                scrapingStatus = undefined; // No scraping needed if fetched
                                 logger.info(`Found recent data for website: ${normalizedWebsite}`);
                             } else {
                                 status = 'To Process'; // Data is old
+                                scrapingStatus = 'Pending'; // Needs scraping
                                 logger.info(`Found old data for website: ${normalizedWebsite}, marking for reprocessing.`);
                             }
                         } else {
                             status = 'To Process'; // Missing or invalid timestamp
+                            scrapingStatus = 'Pending'; // Needs scraping
                             logger.warn(`Missing or invalid lastUpdated timestamp for website: ${normalizedWebsite}`);
                         }
                     } else {
                         status = 'To Process'; // Not found
+                        scrapingStatus = 'Pending'; // Needs scraping
                         logger.info(`No data found for website: ${normalizedWebsite}`);
                     }
                 } catch (dbError) {
                     logger.error(`Firestore query error for website "${normalizedWebsite}":`, dbError);
                     errorMessage = `Firestore error checking website: ${normalizedWebsite}`;
                     status = 'Error';
+                    scrapingStatus = 'Failed_Error'; // Cannot scrape if DB check failed
                 }
             } else if (status !== 'Error' && !normalizedWebsite && originalWebsite) {
                 // Website existed but was invalid format after normalization attempt
                  errorMessage = `Invalid website format: ${originalWebsite}`;
                  status = 'Error';
-            } else if (status !== 'Error') {
-                // No website provided or error occurred earlier
-                 logger.info("Skipping Firestore check as normalizedWebsite is null or status is Error.");
+                 scrapingStatus = 'Failed_Error'; // Cannot scrape invalid URL
+            } else if (status !== 'Error' && !normalizedWebsite) {
+                 // No website provided
+                 status = 'To Process'; // Still processable maybe, but no website to check/scrape
+                 scrapingStatus = undefined; // Cannot scrape without a website
+                 logger.info("No website provided, skipping Firestore check and scraping.");
+            } else if (status === 'Error') {
+                 // Error occurred during normalization, already handled scrapingStatus
+                 logger.info("Skipping Firestore check due to prior normalization error.");
             }
 
 
@@ -357,8 +378,18 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
                 originalData: { companyName: originalCompanyName, country: originalCountry, website: originalWebsite },
                 normalizedData: { companyName: normalizedCompanyName, country: normalizedCountry, website: normalizedWebsite },
                 status,
+                scrapingStatus, // Include initial scraping status
                 ...(errorMessage && { errorMessage }), // Add error message if present
-                ...(fetchedData && { fetchedData }), // Add fetched data if present
+                ...(fetchedData && {
+                    fetchedData: {
+                        ...fetchedData,
+                        // Convert timestamp to string for JSON serialization if needed by client,
+                        // but maybe client doesn't need it directly? Let's keep it as Timestamp for now.
+                        // lastUpdated: fetchedData.lastUpdated instanceof admin.firestore.Timestamp
+                        //                 ? fetchedData.lastUpdated.toDate().toISOString()
+                        //                 : undefined,
+                    }
+                }),
             });
         }
 
@@ -371,5 +402,133 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
         const message = error instanceof Error ? error.message : "Unknown processing error";
         if (!res.headersSent) { setCorsHeaders(req, res); }
         res.status(500).json({ error: `Failed to process data: ${message}` });
+    }
+});
+
+
+// --- Phase 4: Scrape Website Content Function ---
+
+// Helper function to scrape a single URL
+async function scrapeSingleUrl(url: string): Promise<string | null> {
+    try {
+        logger.info(`Attempting to scrape: ${url}`);
+        const response = await axios.get(url, {
+            timeout: 15000, // 15 seconds timeout
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36', // Mimic browser
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Connection': 'keep-alive',
+            },
+        });
+
+        if (response.status === 200) {
+            const $ = cheerio.load(response.data);
+            let text = '';
+
+            // Prioritize specific content tags
+            $('article').each((i, el) => { text += $(el).text() + '\n\n'; });
+            if (text.length < 500) { // If article is short or non-existent, try main
+                 $('main').each((i, el) => { text += $(el).text() + '\n\n'; });
+            }
+            // If still very little text, resort to paragraphs
+            if (text.trim().length < 500) {
+                logger.info(`Low text from article/main tags for ${url}, trying p tags.`);
+                text = $('p').map((i, el) => $(el).text()).get().join('\n\n');
+            }
+
+            const sanitizedText = text.replace(/\s\s+/g, ' ').trim();
+            logger.info(`Successfully scraped ${url}, raw length: ${text.length}, sanitized length: ${sanitizedText.length}`);
+            return sanitizedText.length > 50 ? sanitizedText : null; // Return null if very little text found
+        } else {
+            logger.warn(`Scraping ${url} failed with status: ${response.status}`);
+            return null;
+        }
+    } catch (error: any) {
+        if (axios.isAxiosError(error)) {
+            logger.error(`Axios error scraping ${url}: ${error.message}`, { status: error.response?.status });
+        } else {
+            logger.error(`Error scraping ${url}:`, error);
+        }
+        return null;
+    }
+}
+
+export const scrapeWebsiteContent = onRequest({ memory: "1GiB", timeoutSeconds: 60 }, async (req: Request, res: Response): Promise<void> => {
+     // --- Manual CORS Handling ---
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") {
+        res.status(204).send(""); return;
+    }
+    // --------------------------
+
+    if (req.method !== "POST") {
+        res.status(405).send("Method Not Allowed"); return;
+    }
+
+    try {
+        const { websiteUrl, companyName } = req.body as { websiteUrl?: string, companyName?: string };
+
+        if (!websiteUrl || typeof websiteUrl !== 'string') {
+            if (!res.headersSent) setCorsHeaders(req, res);
+            res.status(400).json({ error: "Missing or invalid 'websiteUrl' in request body.", status: 'Failed_Error', scrapedText: null });
+            return;
+        }
+
+        logger.info(`Received scrape request for: ${websiteUrl}`, { companyName });
+
+        const fullUrl = `https://${websiteUrl}`;
+        let scrapedText: string | null = null;
+        let finalStatus: ProcessedRowResult['scrapingStatus'] = 'Failed_Error'; // Default to error
+        let errorMessage: string | undefined;
+
+        try {
+             scrapedText = await scrapeSingleUrl(fullUrl);
+
+             // Optionally try '/about' page if main page yielded little text
+             if (!scrapedText || scrapedText.length < 1000) { // Threshold for trying /about
+                logger.info(`Main page scrape for ${websiteUrl} yielded little text, trying /about...`);
+                const aboutUrl = `${fullUrl}/about`;
+                const aboutText = await scrapeSingleUrl(aboutUrl);
+                if (aboutText) {
+                    scrapedText = (scrapedText ? scrapedText + '\n\n--- About Page ---\n\n' : '') + aboutText;
+                    logger.info(`Appended text from ${aboutUrl}`);
+                }
+             }
+
+             if (scrapedText && scrapedText.length > 0) {
+                 finalStatus = 'Success';
+                 // Limit length
+                 const maxLength = 10000; // Approx 10k characters
+                 if (scrapedText.length > maxLength) {
+                     scrapedText = scrapedText.substring(0, maxLength) + '... [truncated]';
+                     logger.info(`Truncated scraped text for ${websiteUrl} to ${maxLength} characters.`);
+                 }
+             } else {
+                 finalStatus = 'Failed_Scrape';
+                 errorMessage = `Scraping successful but yielded no significant content from ${websiteUrl} or its /about page.`;
+                 logger.warn(errorMessage);
+             }
+
+        } catch (scrapeError: any) {
+            logger.error(`Unexpected error during scraping process for ${websiteUrl}:`, scrapeError);
+            finalStatus = 'Failed_Error';
+            errorMessage = scrapeError instanceof Error ? scrapeError.message : "Unknown scraping error occurred.";
+            scrapedText = null; // Ensure text is null on error
+        }
+
+
+        if (!res.headersSent) setCorsHeaders(req, res);
+        res.status(200).json({
+            scrapedText,
+            status: finalStatus,
+            ...(errorMessage && { error: errorMessage }) // Include error message if scrape failed
+        });
+
+    } catch (error: unknown) {
+        logger.error("Error in scrapeWebsiteContent function:", error);
+        const message = error instanceof Error ? error.message : "Unknown processing error";
+        if (!res.headersSent) { setCorsHeaders(req, res); }
+        res.status(500).json({ error: `Failed to process scraping request: ${message}`, status: 'Failed_Error', scrapedText: null });
     }
 });

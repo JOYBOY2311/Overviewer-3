@@ -34,8 +34,12 @@
         "function": "detectHeaders"
       },
        {
-         "source": "/api/normalizeAndCheck", // Added route for normalizeAndCheck
+         "source": "/api/normalizeAndCheck",
          "function": "normalizeAndCheck"
+       },
+       {
+         "source": "/api/scrapeWebsiteContent",
+         "function": "scrapeWebsiteContent"
        },
        {
          "source": "**",
