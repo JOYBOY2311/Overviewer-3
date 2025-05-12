@@ -221,6 +221,7 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
     }
     let allHeaders: string[] = [];
     try {
+        // Adjust expected structure if 'originalIndex' isn't sent from frontend initially
         const { rows, confirmedHeaders, headers: inputHeaders } = req.body as { rows: ExcelRow[], confirmedHeaders: ConfirmedHeaderMapping, headers: string[] };
         if (!Array.isArray(rows)) {
             throw new Error("Invalid input: 'rows' must be an array.");
@@ -236,7 +237,7 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
         }
         allHeaders = inputHeaders;
         logger.info(`Starting normalizeAndCheck for ${rows.length} rows.`);
-        const results: Omit<ProcessedRowResult, 'originalIndex'>[] = []; // Use Omit here, originalIndex added later
+        const results: ProcessedRowResult[] = []; // Use ProcessedRowResult directly now
         const sixMonthsAgo = new Date();
         sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
         const getIndex = (headerName: string | null): number => {
@@ -251,7 +252,9 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
         const countryIndex = getIndex(confirmedHeaders.country);
         const websiteIndex = getIndex(confirmedHeaders.website);
 
-        for (const row of rows) {
+        for (let i = 0; i < rows.length; i++) { // Iterate with index
+            const row = rows[i];
+            const originalIndex = i; // Store the original index
             let status: ProcessedRowResult['status'] = 'To Process';
             let fetchedData: ProcessedRowResult['fetchedData'] | undefined = undefined;
             let errorMessage: string | undefined = undefined;
@@ -369,6 +372,7 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
             }
 
             results.push({
+                originalIndex, // Include original index
                 originalData: { companyName: originalCompanyName, country: originalCountry, website: originalWebsite },
                 normalizedData: { companyName: normalizedCompanyName, country: normalizedCountry, website: normalizedWebsite },
                 status,
@@ -393,11 +397,18 @@ export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120
     }
 });
 
+
+/**
+ * Attempts to scrape text content from a single URL.
+ * Prioritizes <article>, then <main>, then <p> tags.
+ * @param url The full URL to scrape (including https://).
+ * @returns The extracted text content (string) or null if scraping fails or yields minimal text.
+ */
 async function scrapeSingleUrl(url: string): Promise<string | null> {
     try {
         logger.info(`Attempting to scrape: ${url}`);
         const response = await axios.get(url, {
-            timeout: 15000,
+            timeout: 15000, // 15 second timeout
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
                 'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8',
@@ -405,35 +416,44 @@ async function scrapeSingleUrl(url: string): Promise<string | null> {
                 'Connection': 'keep-alive',
             },
         });
+
         if (response.status === 200) {
             const $ = cheerio.load(response.data);
             let text = '';
+
+            // Prioritize specific content tags
             $('article').each((i, el) => { text += $(el).text() + '\n\n'; });
-            if (text.length < 500) {
+            if (text.trim().length < 500) { // Only try <main> if <article> is short
                 $('main').each((i, el) => { text += $(el).text() + '\n\n'; });
             }
+
+            // Fallback to paragraph tags if still insufficient
             if (text.trim().length < 500) {
-                logger.info(`Low text from article/main tags for ${url}, trying p tags.`);
+                logger.info(`Low text yield from article/main tags for ${url}, trying p tags.`);
                 text = $('p').map((i, el) => $(el).text()).get().join('\n\n');
             }
+
             const sanitizedText = text.replace(/\s\s+/g, ' ').trim();
-            logger.info(`Successfully scraped ${url}, raw length: ${text.length}, sanitized length: ${sanitizedText.length}`);
+            logger.info(`Successfully scraped ${url}. Raw length: ${text.length}, Sanitized length: ${sanitizedText.length}`);
+
+            // Return text only if it meets a minimum length threshold
             return sanitizedText.length > 50 ? sanitizedText : null;
         } else {
             logger.warn(`Scraping ${url} failed with status: ${response.status}`);
             return null;
         }
-    } catch (error: any) {
+    } catch (error: unknown) {
         if (axios.isAxiosError(error)) {
             logger.error(`Axios error scraping ${url}: ${error.message}`, { status: error.response?.status });
         } else {
-            logger.error(`Error scraping ${url}:`, error);
+            logger.error(`General error scraping ${url}:`, error);
         }
-        return null;
+        return null; // Indicate failure
     }
 }
 
-export const scrapeWebsiteContent = onRequest({ memory: "1GiB", timeoutSeconds: 60 }, async (req: Request, res: Response): Promise<void> => {
+
+export const scrapeWebsiteContent = onRequest({ memory: "1GiB", timeoutSeconds: 120 }, async (req: Request, res: Response): Promise<void> => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") {
         res.status(204).send(""); return;
@@ -441,6 +461,7 @@ export const scrapeWebsiteContent = onRequest({ memory: "1GiB", timeoutSeconds: 
     if (req.method !== "POST") {
         res.status(405).send("Method Not Allowed"); return;
     }
+
     try {
         const { websiteUrl, companyName } = req.body as { websiteUrl?: string, companyName?: string };
         if (!websiteUrl || typeof websiteUrl !== 'string') {
@@ -448,54 +469,84 @@ export const scrapeWebsiteContent = onRequest({ memory: "1GiB", timeoutSeconds: 
             res.status(400).json({ error: "Missing or invalid 'websiteUrl' in request body.", status: 'Failed_Error', scrapedText: null });
             return;
         }
-        logger.info(`Received scrape request for: ${websiteUrl}`, { companyName });
-        const fullUrl = `https://${websiteUrl}`;
-        let scrapedText: string | null = null;
-        let finalStatus: ProcessedRowResult['scrapingStatus'] = 'Failed_Error';
-        let errorMessage: string | undefined;
 
-        try {
-            scrapedText = await scrapeSingleUrl(fullUrl);
-            if (!scrapedText || scrapedText.length < 1000) {
-                logger.info(`Main page scrape for ${websiteUrl} yielded little text, trying /about...`);
-                const aboutUrl = `${fullUrl}/about`; // Consider also /about-us or other variants
-                const aboutText = await scrapeSingleUrl(aboutUrl);
-                if (aboutText) {
-                    scrapedText = (scrapedText ? scrapedText + '\n\n--- About Page ---\n\n' : '') + aboutText;
-                    logger.info(`Appended text from ${aboutUrl}`);
-                }
-            }
-            if (scrapedText && scrapedText.length > 0) {
-                finalStatus = 'Success';
-                const maxLength = 10000; // Limit text length for LLM
-                if (scrapedText.length > maxLength) {
-                    scrapedText = scrapedText.substring(0, maxLength) + '... [truncated]';
-                    logger.info(`Truncated scraped text for ${websiteUrl} to ${maxLength} characters.`);
-                }
-            } else {
-                finalStatus = 'Failed_Scrape';
-                errorMessage = `Scraping successful but yielded no significant content from ${websiteUrl} or its /about page.`;
-                logger.warn(errorMessage);
-            }
-        } catch (scrapeError: any) {
-            logger.error(`Unexpected error during scraping process for ${websiteUrl}:`, scrapeError);
-            finalStatus = 'Failed_Error';
-            errorMessage = scrapeError instanceof Error ? scrapeError.message : "Unknown scraping error occurred.";
-            scrapedText = null;
+        logger.info(`Received scrape request for: ${websiteUrl}`, { companyName });
+        const baseUrl = `https://${websiteUrl}`;
+        let combinedText = '';
+        let finalStatus: ProcessedRowResult['scrapingStatus'] = 'Pending'; // Start as pending
+        let errorMessage: string | undefined;
+        const minTextLength = 1000; // Target combined text length
+
+        // --- Try scraping main page ---
+        let mainText = await scrapeSingleUrl(baseUrl);
+        if (mainText) {
+            combinedText += mainText;
         }
+
+        // --- Try scraping /about if not enough text ---
+        if (combinedText.length < minTextLength) {
+            logger.info(`Text from ${baseUrl} is short (${combinedText.length}), trying /about...`);
+            const aboutUrl = `${baseUrl}/about`;
+            const aboutText = await scrapeSingleUrl(aboutUrl);
+            if (aboutText) {
+                combinedText += (combinedText.length > 0 ? '\n\n--- About Page ---\n\n' : '') + aboutText;
+                logger.info(`Appended text from ${aboutUrl}`);
+            }
+        }
+
+         // --- Try scraping /contact if not enough text ---
+         if (combinedText.length < minTextLength) {
+            logger.info(`Text still short (${combinedText.length}), trying /contact...`);
+            const contactUrl = `${baseUrl}/contact`;
+            const contactText = await scrapeSingleUrl(contactUrl);
+            if (contactText) {
+                combinedText += (combinedText.length > 0 ? '\n\n--- Contact Page ---\n\n' : '') + contactText;
+                logger.info(`Appended text from ${contactUrl}`);
+            }
+        }
+
+         // --- Try scraping /services if not enough text ---
+         if (combinedText.length < minTextLength) {
+            logger.info(`Text still short (${combinedText.length}), trying /services...`);
+            const servicesUrl = `${baseUrl}/services`;
+            const servicesText = await scrapeSingleUrl(servicesUrl);
+            if (servicesText) {
+                combinedText += (combinedText.length > 0 ? '\n\n--- Services Page ---\n\n' : '') + servicesText;
+                logger.info(`Appended text from ${servicesUrl}`);
+            }
+        }
+
+        // --- Final Check and Truncation ---
+        if (combinedText.length > 50) { // Use a smaller threshold to determine success vs. failure
+            finalStatus = 'Success';
+            const maxLength = 15000; // Limit total text length for LLM
+            if (combinedText.length > maxLength) {
+                combinedText = combinedText.substring(0, maxLength) + '... [truncated]';
+                logger.info(`Truncated combined scraped text for ${websiteUrl} to ${maxLength} characters.`);
+            }
+        } else {
+            finalStatus = 'Failed_Scrape';
+            errorMessage = `Scraping yielded no significant content from ${websiteUrl} or common subpages (/about, /contact, /services).`;
+            logger.warn(errorMessage);
+            combinedText = ''; // Ensure text is empty on failure
+        }
+
         if (!res.headersSent) setCorsHeaders(req, res);
         res.status(200).json({
-            scrapedText,
+            scrapedText: finalStatus === 'Success' ? combinedText : null,
             status: finalStatus,
-            ...(errorMessage && { error: errorMessage })
+            ...(errorMessage && finalStatus !== 'Success' && { error: errorMessage }) // Only include error message on failure
         });
+
     } catch (error: unknown) {
         logger.error("Error in scrapeWebsiteContent function:", error);
         const message = error instanceof Error ? error.message : "Unknown processing error";
         if (!res.headersSent) { setCorsHeaders(req, res); }
+        // Ensure status indicates error on unexpected failure
         res.status(500).json({ error: `Failed to process scraping request: ${message}`, status: 'Failed_Error', scrapedText: null });
     }
 });
+
 
 export const processAndSummarizeContent = onRequest({ memory: "1GiB", timeoutSeconds: 120 }, async (req: Request, res: Response): Promise<void> => {
     setCorsHeaders(req, res);
@@ -543,6 +594,21 @@ interface SaveDataPayload {
     // Add any other fields needed from ProcessedRowResult
 }
 
+// Define the type for the data to be saved to Firestore
+interface CompanyDataToSave {
+    website: string;
+    originalCompanyName: string | null;
+    originalCountry: string | null;
+    originalWebsite: string | null;
+    normalizedCompanyName: string | null;
+    normalizedCountry: string | null;
+    summary: string | null;
+    independenceCriteria: "Yes" | "";
+    insufficientInfo: "Yes" | "";
+    lastUpdated: admin.firestore.FieldValue;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    [key: string]: any; // Allow for additional string keys with any value
+}
 export const saveCompanyData = onRequest({ memory: "512MiB", timeoutSeconds: 60 }, async (req: Request, res: Response): Promise<void> => {
     setCorsHeaders(req, res);
     if (req.method === "OPTIONS") {
@@ -578,7 +644,7 @@ export const saveCompanyData = onRequest({ memory: "512MiB", timeoutSeconds: 60 
         const website = input.normalizedData.website; // Use normalized website as the key identifier
 
         // --- Prepare Data for Firestore ---
-        const dataToSave: Record<string, any> = {
+        const dataToSave: CompanyDataToSave = {
             // Use normalized website as the primary key field in the document
             website: website,
             // Store original data for reference
@@ -629,3 +695,4 @@ export const saveCompanyData = onRequest({ memory: "512MiB", timeoutSeconds: 60 
         res.status(500).json({ error: `Failed to save data: ${message}`, success: false });
     }
 });
+

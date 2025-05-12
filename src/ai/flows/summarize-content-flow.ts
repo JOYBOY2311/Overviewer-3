@@ -60,7 +60,7 @@ const summarizeContentFlow = ai.defineFlow(
     inputSchema: SummarizeContentInputSchema,
     outputSchema: SummarizeContentOutputSchema,
   },
-  async (input: SummarizeContentInput) => {
+  async (input: SummarizeContentInput): Promise<SummarizeContentOutput> => {
     if (!input.companyText || input.companyText.trim() === "") {
         console.warn("summarizeContentFlow received empty companyText.");
         return {
