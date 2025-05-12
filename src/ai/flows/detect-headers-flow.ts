@@ -52,7 +52,7 @@ const detectHeadersFlow = ai.defineFlow(
     inputSchema: DetectHeadersInputSchema,
     outputSchema: DetectHeadersOutputSchema,
   },
-  async (input) => {
+  async (input: DetectHeadersInput) => {
     // Ensure headers list is not empty
     if (!input.headers || input.headers.length === 0) {
         console.warn("detectHeadersFlow received empty headers array.");

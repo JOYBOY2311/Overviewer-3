@@ -1,192 +1,375 @@
+
 /**
  * Import function triggers from their respective submodules:
- *
- * import {onCall} from "firebase-functions/v2/https";
- * import {onDocumentWritten} from "firebase-functions/v2/firestore";
- * import {onMessagePublished} from "firebase-functions/v2/pubsub";
- * import {onObjectFinalized} from "firebase-functions/v2/storage";
- * import {onSchedule} from "firebase-functions/v2/scheduler";
- * import {onRequest} from "firebase-functions/v2/https";
- *
- * See a full list of supported triggers at https://firebase.google.com/docs/functions
+ * ... (comments) ...
  */
 
-import {onRequest} from "firebase-functions/v2/https";
+import { onRequest } from "firebase-functions/v2/https";
 import * as logger from "firebase-functions/logger";
-import * as Busboy from "busboy";
+import { Request, Response } from "express";
+// import * as Busboy from "busboy"; // <--- REMOVED THIS
+import Busboy from 'busboy'; // <--- ADDED THIS (Default Import)
 import * as XLSX from "xlsx";
 import * as os from "os";
 import * as path from "path";
 import * as fs from "fs";
-import * as cors from "cors";
+import * as admin from 'firebase-admin'; // Added Firebase Admin SDK
 
-// Import Genkit flow - assuming build places it correctly relative to lib/index.js
-// Adjust path if necessary based on your build process
-import {detectHeaders, DetectHeadersInput, DetectHeadersOutput} from "../../src/ai/flows/detect-headers-flow";
+// Import Genkit flow - Renamed import, REMOVED DetectHeadersOutput type import
+import { detectHeaders as detectHeadersFlow, DetectHeadersInput, DetectHeadersOutput } from "../../src/ai/flows/detect-headers-flow"; // Assuming path is resolved
 
-
-// Initialize CORS middleware with options allowing specific origins or all
-// In production, restrict this to your app's domain
-const corsHandler = cors({origin: true});
+// --- Initialize Firebase Admin SDK ---
+// Do this once globally
+try {
+    admin.initializeApp();
+    logger.info("Firebase Admin SDK initialized successfully.");
+} catch (error) {
+    logger.error("Error initializing Firebase Admin SDK:", error);
+    // If initialization fails, subsequent Firestore operations will likely fail.
+    // Consider how to handle this based on your app's requirements.
+    // For now, log the error and let the functions proceed (they will likely fail later).
+}
+const db = admin.firestore(); // Get Firestore instance
+// ------------------------------------
 
 
 // Define the type for a row parsed from Excel
-// Using any[] for flexibility, but could be more specific if needed
 type ExcelRow = (string | number | boolean | Date | null)[];
 
+// Define the mapping structure confirmed by the user
+type ConfirmedHeaderMapping = {
+    name: string | null;
+    country: string | null;
+    website: string | null;
+};
 
-export const parseSheet = onRequest({memory: "512MiB", timeoutSeconds: 60}, (req, res) => {
-  // Handle CORS preflight requests and regular requests
-  corsHandler(req, res, async () => {
+// Define the structure for the result of processing a single row in Phase 3
+type ProcessedRowResult = {
+    originalData: {
+        companyName: string | null;
+        country: string | null;
+        website: string | null;
+        // Add other original fields if needed
+    };
+    normalizedData: {
+        companyName: string | null;
+        country: string | null;
+        website: string | null;
+    };
+    status: 'Fetched' | 'To Process' | 'Error';
+    errorMessage?: string; // Optional error message for this row
+    fetchedData?: { // Optional data fetched from Firestore
+        summary?: string; // Example field, adjust as needed
+        lastUpdated?: Date;
+        // Add other relevant fields from Firestore doc
+    };
+};
+
+// --- Helper function for Manual CORS ---
+const setCorsHeaders = (req: Request, res: Response): void => {
+    res.set("Access-Control-Allow-Origin", "*"); // Adjust for production if needed
+    res.set("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS, POST, PUT");
+    res.set("Access-Control-Allow-Headers", "Origin, X-Requested-With, Content-Type, Accept, Authorization");
+};
+// --------------------------------------
+
+export const parseSheet = onRequest({ memory: "512MiB", timeoutSeconds: 60 }, (req: Request, res: Response) => {
+    // --- Manual CORS Handling ---
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") {
+        res.status(204).send(""); return;
+    }
+    // --------------------------
+
     if (req.method !== "POST") {
-      res.status(405).send("Method Not Allowed");
-      return;
+        res.status(405).send("Method Not Allowed"); return;
     }
 
-    // Use Busboy to parse multipart/form-data
-    const busboy = Busboy({headers: req.headers});
-    const tmpdir = os.tmpdir();
-    const fileWrites: Promise<void>[] = [];
-    let uploadedFilePath = "";
-    let fileBuffer: Buffer | null = null;
+    try { // Added outer try block for synchronous errors like Busboy constructor
+        const busboy = Busboy({ headers: req.headers }); // Call remains the same, relies on default import now
+        const tmpdir = os.tmpdir();
+        const fileWrites: Promise<void>[] = [];
+        let uploadedFilePath = "";
+        let fileBuffer: Buffer | null = null;
 
-    // Listener for file stream
-    busboy.on("file", (fieldname, file, filename) => {
-      logger.info(`Processing file: ${filename.filename}`);
-
-      // Note: Busboy types might show 'filename' directly, but examples often use the object structure.
-      // Adjust based on actual library behavior if needed.
-      const filepath = path.join(tmpdir, filename.filename);
-      uploadedFilePath = filepath;
-
-      const writeStream = fs.createWriteStream(filepath);
-      file.pipe(writeStream);
-
-      // Collect file buffer in memory (alternative to writing to disk)
-      const chunks: Buffer[] = [];
-       file.on("data", (chunk) => {
-         chunks.push(chunk);
-       });
-
-      // File was processed by Busboy; wait for stream finish
-      const promise = new Promise<void>((resolve, reject) => {
-        file.on("end", () => {
-           fileBuffer = Buffer.concat(chunks); // Store buffer when file stream ends
-          writeStream.end();
+        busboy.on("file", (fieldname: string, file: NodeJS.ReadableStream, filename: Busboy.FileInfo) => { // Corrected FileInfo type usage if needed based on @types/busboy
+            logger.info(`Processing file: ${filename.filename}`);
+            const filepath = path.join(tmpdir, filename.filename);
+            uploadedFilePath = filepath;
+            const writeStream = fs.createWriteStream(filepath);
+            file.pipe(writeStream);
+            const chunks: Buffer[] = [];
+            file.on("data", (chunk: Buffer) => { chunks.push(chunk); });
+            const promise = new Promise<void>((resolve, reject) => {
+                file.on("end", () => { fileBuffer = Buffer.concat(chunks); writeStream.end(); });
+                writeStream.on("finish", resolve);
+                writeStream.on("error", reject);
+            });
+            fileWrites.push(promise);
         });
-        writeStream.on("finish", resolve);
-        writeStream.on("error", reject);
-      });
-      fileWrites.push(promise);
-    });
 
+        busboy.on("finish", async () => {
+            try {
+                await Promise.all(fileWrites);
+                if (!fileBuffer || fileBuffer.length === 0) {
+                    if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
+                        logger.warn("Reading file from disk as buffer was null or empty.");
+                        fileBuffer = fs.readFileSync(uploadedFilePath);
+                         if (!fileBuffer || fileBuffer.length === 0) {
+                            throw new Error("File buffer is empty even after disk fallback.");
+                        }
+                    } else {
+                         throw new Error("No file uploaded or file buffer is empty.");
+                    }
+                }
+                logger.info("Parsing workbook from buffer...");
+                // Enforce cellDates: false to avoid potential date object issues downstream
+                // If dates are needed, handle conversion carefully later.
+                const workbook = XLSX.read(fileBuffer, { type: "buffer", cellDates: false });
+                const sheetName = workbook.SheetNames[0];
+                const worksheet = workbook.Sheets[sheetName];
+                if (!worksheet) { throw new Error(`Sheet "${sheetName}" not found or empty.`); }
+                // Parse with raw: true to get raw cell values (strings, numbers, booleans)
+                const jsonData = XLSX.utils.sheet_to_json<ExcelRow>(worksheet, { header: 1, defval: null, raw: true });
+                if (jsonData.length === 0) { logger.info("Sheet contains no data."); res.status(200).json({ headers: [], rows: [] }); return; }
 
-    // Listener for completion of form parsing
-    busboy.on("finish", async () => {
-      try {
-        // Wait for all file writes to complete (if writing to disk)
-        // await Promise.all(fileWrites); - No longer strictly needed if using buffer
+                // Ensure headers are strings
+                const headers: string[] = jsonData[0].map((header) => String(header ?? ""));
 
-        if (!fileBuffer) {
-            // If we didn't write to disk and buffer is empty, means no file was uploaded correctly
-             if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
-                // Fallback: read from disk if buffer failed but file exists
-                logger.warn("Reading file from disk as buffer was null.");
-                fileBuffer = fs.readFileSync(uploadedFilePath);
-            } else {
-                 throw new Error("No file uploaded or file buffer is empty.");
+                // Ensure rows are arrays of primitive types or null
+                const rows: ExcelRow[] = jsonData.slice(1).map(row =>
+                    row.map(cell => (cell === undefined ? null : cell)) // Replace undefined with null
+                );
+
+                logger.info(`Parsed ${headers.length} headers and ${rows.length} rows.`);
+                res.status(200).json({ headers, rows });
+            } catch (error: unknown) {
+                logger.error("Error parsing Excel file:", error);
+                const errorMessage = error instanceof Error ? error.message : "Unknown parsing error";
+                if (!res.headersSent) { setCorsHeaders(req, res); }
+                res.status(500).json({ error: `Failed to parse Excel file: ${errorMessage}` });
+            } finally {
+                if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
+                    try { fs.unlinkSync(uploadedFilePath); logger.info(`Temporary file deleted: ${uploadedFilePath}`); } catch (unlinkError) { logger.error(`Error deleting temporary file ${uploadedFilePath}:`, unlinkError); }
+                }
             }
-        }
+        });
 
-        logger.info("Parsing workbook from buffer...");
-        // Parse the workbook directly from the buffer
-        const workbook = XLSX.read(fileBuffer, { type: "buffer", cellDates: true });
-        const sheetName = workbook.SheetNames[0];
-        const worksheet = workbook.Sheets[sheetName];
+        busboy.on("error", (err: Error) => {
+            logger.error("Busboy error:", err);
+             if (!res.headersSent) { setCorsHeaders(req, res); }
+            res.status(500).json({ error: "Error processing form data." });
+        });
 
-        if (!worksheet) {
-            throw new Error(`Sheet "${sheetName}" not found or empty.`);
-        }
+        req.pipe(busboy);
 
-        // Use header: 1 to get array of arrays, defval: null for empty cells
-        const jsonData = XLSX.utils.sheet_to_json<ExcelRow>(worksheet, { header: 1, defval: null });
-
-        if (jsonData.length === 0) {
-           res.status(200).json({ headers: [], rows: [] }); // Return empty if sheet has no data
-           return; // Exit early
-        }
-
-        // Extract headers (first row), ensuring they are strings
-        const headers: string[] = jsonData[0].map((header) => String(header ?? ""));
-        // Extract rows (subsequent rows)
-        const rows: ExcelRow[] = jsonData.slice(1);
-
-        logger.info(`Parsed ${headers.length} headers and ${rows.length} rows.`);
-        res.status(200).json({ headers, rows });
-      } catch (error: unknown) {
-        logger.error("Error parsing Excel file:", error);
-        const errorMessage = error instanceof Error ? error.message : "Unknown parsing error";
-        res.status(500).json({ error: `Failed to parse Excel file: ${errorMessage}` });
-      } finally {
-         // Clean up the temporary file if it was created
-         if (uploadedFilePath && fs.existsSync(uploadedFilePath)) {
-           try {
-             fs.unlinkSync(uploadedFilePath);
-             logger.info(`Temporary file deleted: ${uploadedFilePath}`);
-           } catch (unlinkError) {
-             logger.error(`Error deleting temporary file ${uploadedFilePath}:`, unlinkError);
-           }
-         }
-      }
-    });
-
-     // Handle errors from Busboy
-     busboy.on("error", (err) => {
-       logger.error("Busboy error:", err);
-       res.status(500).json({error: "Error processing form data."});
-     });
-
-    // Pipe request to Busboy - needed for Node.js streams < v16
-     if ((req as any).rawBody) {
-       busboy.end((req as any).rawBody);
-     } else {
-       req.pipe(busboy);
-     }
-  });
+    } catch(error) { // Catch synchronous errors (e.g., Busboy constructor failure)
+         logger.error("Synchronous error in parseSheet:", error);
+         const errorMessage = error instanceof Error ? error.message : "Unknown error";
+          if (!res.headersSent) { setCorsHeaders(req, res); }
+         res.status(500).json({ error: `Failed to process request: ${errorMessage}` });
+    }
 });
 
 
-// New Function: detectHeaders
-export const detectHeaders = onRequest({memory: "512MiB", timeoutSeconds: 60}, (req, res) => {
-    corsHandler(req, res, async () => {
-        if (req.method !== "POST") {
-            res.status(405).send("Method Not Allowed");
+export const detectHeaders = onRequest({ memory: "512MiB", timeoutSeconds: 60 }, (req: Request, res: Response) => {
+    // --- Manual CORS Handling ---
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") {
+        res.status(204).send(""); return;
+    }
+    // --------------------------
+
+    if (req.method !== "POST") {
+        res.status(405).send("Method Not Allowed"); return;
+    }
+
+    try {
+        const inputData = req.body as DetectHeadersInput; // Type assertion used here
+        if (!inputData || !Array.isArray(inputData.headers) || inputData.headers.length === 0) {
+            logger.error("Invalid input: 'headers' array is required.", { body: req.body });
+            if (!res.headersSent) { setCorsHeaders(req, res); }
+            res.status(400).json({ error: "Invalid input: 'headers' array is required and must not be empty." });
             return;
         }
 
-        try {
-            const inputData = req.body as DetectHeadersInput;
+        logger.info("Calling detectHeaders Genkit flow with headers:", inputData.headers);
 
-            // Basic validation
-            if (!inputData || !Array.isArray(inputData.headers) || inputData.headers.length === 0) {
-                logger.error("Invalid input: 'headers' array is required.", { body: req.body });
-                res.status(400).json({ error: "Invalid input: 'headers' array is required." });
-                return;
+        // Call the RENAMED Genkit flow import using .then() and .catch()
+        detectHeadersFlow(inputData).then((result: DetectHeadersOutput) => { // Explicitly type result
+            logger.info("detectHeaders Genkit flow completed successfully.", { result });
+            if (!res.headersSent) { setCorsHeaders(req, res); }
+            res.status(200).json(result);
+        }).catch((error: Error) => { // Catch block expects Error type
+            logger.error("Error calling detectHeaders Genkit flow:", error);
+            const errorMessage = error instanceof Error ? error.message : "Unknown AI processing error";
+            if (!res.headersSent) { setCorsHeaders(req, res); }
+            res.status(500).json({ error: `Failed to detect headers: ${errorMessage}` });
+        });
+
+    } catch (error: unknown) {
+        logger.error("Synchronous error in detectHeaders function:", error);
+        const errorMessage = error instanceof Error ? error.message : "Unknown processing error";
+         if (!res.headersSent) { setCorsHeaders(req, res); }
+        res.status(500).json({ error: `Failed to process request: ${errorMessage}` });
+    }
+});
+
+
+// --- Phase 3: Normalize and Check Function ---
+export const normalizeAndCheck = onRequest({ memory: "1GiB", timeoutSeconds: 120 }, async (req: Request, res: Response): Promise<void> => {
+    // --- Manual CORS Handling ---
+    setCorsHeaders(req, res);
+    if (req.method === "OPTIONS") {
+        res.status(204).send(""); return;
+    }
+    // --------------------------
+
+    if (req.method !== "POST") {
+        res.status(405).send("Method Not Allowed"); return;
+    }
+
+    let allHeaders: string[] = []; // Keep track of headers for index lookup
+
+    try {
+        // --- Input Validation ---
+        const { rows, confirmedHeaders, headers: inputHeaders } = req.body as { rows: ExcelRow[], confirmedHeaders: ConfirmedHeaderMapping, headers: string[] };
+
+        if (!Array.isArray(rows)) {
+            throw new Error("Invalid input: 'rows' must be an array.");
+        }
+        if (!confirmedHeaders || typeof confirmedHeaders !== 'object') {
+            throw new Error("Invalid input: 'confirmedHeaders' object is required.");
+        }
+        if (!confirmedHeaders.name && !confirmedHeaders.country && !confirmedHeaders.website) {
+            throw new Error("Invalid input: At least one confirmed header (name, country, website) is required.");
+        }
+        if (!Array.isArray(inputHeaders) || inputHeaders.length === 0) {
+             throw new Error("Invalid input: 'headers' array is required for index lookup.");
+        }
+        allHeaders = inputHeaders; // Store headers for index lookup
+
+        logger.info(`Starting normalizeAndCheck for ${rows.length} rows.`);
+        const results: ProcessedRowResult[] = [];
+        const sixMonthsAgo = new Date();
+        sixMonthsAgo.setMonth(sixMonthsAgo.getMonth() - 6);
+
+        // --- Helper Function to get index safely ---
+        const getIndex = (headerName: string | null): number => {
+            if (headerName === null || headerName === undefined) return -1;
+            const index = allHeaders.indexOf(headerName);
+            if (index === -1) {
+                logger.warn(`Header "${headerName}" not found in provided headers:`, allHeaders);
+            }
+            return index;
+        };
+
+        const nameIndex = getIndex(confirmedHeaders.name);
+        const countryIndex = getIndex(confirmedHeaders.country);
+        const websiteIndex = getIndex(confirmedHeaders.website);
+
+
+        // --- Processing Logic ---
+        for (const row of rows) {
+            let status: 'Fetched' | 'To Process' | 'Error' = 'To Process';
+            let fetchedData: ProcessedRowResult['fetchedData'] | undefined = undefined;
+            let errorMessage: string | undefined = undefined;
+
+            // Extract Original Data (handle potential index errors)
+            const originalCompanyName = nameIndex !== -1 ? String(row[nameIndex] ?? '') : null;
+            const originalCountry = countryIndex !== -1 ? String(row[countryIndex] ?? '') : null;
+            const originalWebsite = websiteIndex !== -1 ? String(row[websiteIndex] ?? '') : null;
+
+            // Normalize Data
+            const normalizedCompanyName = originalCompanyName ? originalCompanyName.trim().toLowerCase() : null;
+            const normalizedCountry = originalCountry ? originalCountry.trim().toLowerCase() : null;
+            let normalizedWebsite: string | null = null;
+            if (originalWebsite) {
+                try {
+                    let tempWebsite = originalWebsite.trim().toLowerCase();
+                    // Basic normalization: remove http(s)://, www., trailing /
+                    tempWebsite = tempWebsite.replace(/^https?:\/\//, '');
+                    tempWebsite = tempWebsite.replace(/^www\./, '');
+                    tempWebsite = tempWebsite.replace(/\/$/, '');
+                    // Basic validation: check for presence of a dot and no spaces
+                    if (tempWebsite.includes('.') && !tempWebsite.includes(' ')) {
+                         normalizedWebsite = tempWebsite;
+                    } else {
+                        logger.warn(`Invalid website format skipped: ${originalWebsite}`);
+                        // Keep normalizedWebsite as null if format seems wrong
+                    }
+                } catch (normError) {
+                    logger.error(`Error normalizing website "${originalWebsite}":`, normError);
+                    errorMessage = `Error normalizing website: ${originalWebsite}`;
+                    status = 'Error';
+                }
             }
 
-             logger.info("Calling detectHeaders Genkit flow with headers:", inputData.headers);
+            // Firestore Check (only if normalization didn't error and website is present)
+            if (status !== 'Error' && normalizedWebsite) {
+                 try {
+                    const companiesRef = db.collection('companies');
+                    const query = companiesRef.where('website', '==', normalizedWebsite).limit(1);
+                    const snapshot = await query.get();
 
-            // Call the Genkit flow
-            const result: DetectHeadersOutput = await detectHeaders(inputData);
+                    if (!snapshot.empty) {
+                        const doc = snapshot.docs[0];
+                        const docData = doc.data();
 
-             logger.info("detectHeaders Genkit flow completed successfully.", { result });
-            res.status(200).json(result);
+                        if (docData.lastUpdated && docData.lastUpdated instanceof admin.firestore.Timestamp) {
+                            const lastUpdatedDate = docData.lastUpdated.toDate();
+                            if (lastUpdatedDate > sixMonthsAgo) {
+                                status = 'Fetched';
+                                fetchedData = {
+                                    summary: docData.summary || null, // Adjust field names as needed
+                                    lastUpdated: lastUpdatedDate,
+                                    // Add other relevant fields
+                                };
+                                logger.info(`Found recent data for website: ${normalizedWebsite}`);
+                            } else {
+                                status = 'To Process'; // Data is old
+                                logger.info(`Found old data for website: ${normalizedWebsite}, marking for reprocessing.`);
+                            }
+                        } else {
+                            status = 'To Process'; // Missing or invalid timestamp
+                            logger.warn(`Missing or invalid lastUpdated timestamp for website: ${normalizedWebsite}`);
+                        }
+                    } else {
+                        status = 'To Process'; // Not found
+                        logger.info(`No data found for website: ${normalizedWebsite}`);
+                    }
+                } catch (dbError) {
+                    logger.error(`Firestore query error for website "${normalizedWebsite}":`, dbError);
+                    errorMessage = `Firestore error checking website: ${normalizedWebsite}`;
+                    status = 'Error';
+                }
+            } else if (status !== 'Error' && !normalizedWebsite && originalWebsite) {
+                // Website existed but was invalid format after normalization attempt
+                 errorMessage = `Invalid website format: ${originalWebsite}`;
+                 status = 'Error';
+            } else if (status !== 'Error') {
+                // No website provided or error occurred earlier
+                 logger.info("Skipping Firestore check as normalizedWebsite is null or status is Error.");
+            }
 
-        } catch (error: unknown) {
-             logger.error("Error calling detectHeaders Genkit flow:", error);
-             const errorMessage = error instanceof Error ? error.message : "Unknown AI processing error";
-             // Consider more specific error codes based on Genkit errors if possible
-             res.status(500).json({ error: `Failed to detect headers: ${errorMessage}` });
+
+            results.push({
+                originalData: { companyName: originalCompanyName, country: originalCountry, website: originalWebsite },
+                normalizedData: { companyName: normalizedCompanyName, country: normalizedCountry, website: normalizedWebsite },
+                status,
+                ...(errorMessage && { errorMessage }), // Add error message if present
+                ...(fetchedData && { fetchedData }), // Add fetched data if present
+            });
         }
-    });
+
+        logger.info(`normalizeAndCheck completed. Processed ${results.length} rows.`);
+        if (!res.headersSent) { setCorsHeaders(req, res); }
+        res.status(200).json(results);
+
+    } catch (error: unknown) {
+        logger.error("Error in normalizeAndCheck function:", error);
+        const message = error instanceof Error ? error.message : "Unknown processing error";
+        if (!res.headersSent) { setCorsHeaders(req, res); }
+        res.status(500).json({ error: `Failed to process data: ${message}` });
+    }
 });

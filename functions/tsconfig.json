@@ -10,7 +10,9 @@
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
-    "resolveJsonModule": true // Allows importing JSON files
+    "resolveJsonModule": true,
+    "baseUrl": ".",
+    "paths": { "@/*": ["../src/*"] }
   },
   "compileOnSave": true,
   "include": [

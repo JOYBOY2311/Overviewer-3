@@ -26,13 +26,17 @@
     ],
      "rewrites": [
       {
-        "source": "/api/parseSheet", // Using specific API path
+        "source": "/api/parseSheet",
         "function": "parseSheet"
       },
       {
-        "source": "/api/detectHeaders", // Using specific API path
+        "source": "/api/detectHeaders",
         "function": "detectHeaders"
       },
+       {
+         "source": "/api/normalizeAndCheck", // Added route for normalizeAndCheck
+         "function": "normalizeAndCheck"
+       },
        {
          "source": "**",
          "destination": "/index.html"
