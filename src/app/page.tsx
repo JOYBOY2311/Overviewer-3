@@ -2,11 +2,11 @@
 "use client";
 
 import type { ChangeEvent} from 'react';
-import { useState, useEffect, useCallback } from 'react';
-import { Upload, Loader2, CheckCircle, XCircle, AlertCircle, FileCheck2, SearchCode, Bot } from 'lucide-react'; // Added SearchCode, Bot
+import { useState, useEffect } from 'react';
+import { Upload, Loader2, CheckCircle, XCircle, AlertCircle, FileCheck2, SearchCode, Bot, MessageSquareQuote, FileWarning, ShieldQuestion } from 'lucide-react'; // Added new icons
 
 import { Button } from '@/components/ui/button';
-import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card'; // Added CardFooter
+import { Card, CardContent, CardDescription, CardFooter, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '@/components/ui/table';
@@ -14,19 +14,20 @@ import { ScrollArea } from '@/components/ui/scroll-area';
 import { Progress } from '@/components/ui/progress';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 import { Terminal } from "lucide-react";
-import { parseSheetFunctionUrl, detectHeadersFunctionUrl, normalizeAndCheckFunctionUrl, scrapeWebsiteContentFunctionUrl } from '@/lib/config'; // Added scrapeWebsiteContentFunctionUrl
+import { parseSheetFunctionUrl, detectHeadersFunctionUrl, normalizeAndCheckFunctionUrl, scrapeWebsiteContentFunctionUrl, processAndSummarizeContentFunctionUrl } from '@/lib/config'; // Added processAndSummarizeContentFunctionUrl
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Separator } from '@/components/ui/separator';
 import { Skeleton } from '@/components/ui/skeleton';
 import type { DetectHeadersOutput } from '@/ai/flows/detect-headers-flow';
-import { cn } from "@/lib/utils"; // Import cn for conditional classes
-import { Badge } from "@/components/ui/badge"; // Import Badge for status display
+import type { SummarizeContentOutput } from '@/ai/flows/summarize-content-flow'; // Import SummarizeContentOutput
+import { cn } from "@/lib/utils";
+import { Badge } from "@/components/ui/badge";
 import {
   Tooltip,
   TooltipContent,
   TooltipProvider,
   TooltipTrigger,
-} from "@/components/ui/tooltip" // Import Tooltip components
+} from "@/components/ui/tooltip"
 
 // Type for raw data parsed from Excel
 type ExcelRow = (string | number | boolean | Date | null)[];
@@ -47,7 +48,7 @@ type ScrapeResult = {
 };
 
 
-// Type for the result of processing a single row (Phases 3 & 4)
+// Type for the result of processing a single row
 type ProcessedRow = {
     originalData: {
         companyName: string | null;
@@ -60,17 +61,23 @@ type ProcessedRow = {
         country: string | null;
         website: string | null;
     };
-    status: 'Fetched' | 'To Process' | 'Error'; // Phase 3 status
-    errorMessage?: string; // Phase 3 error
+    status: 'Fetched' | 'To Process' | 'Error';
+    errorMessage?: string;
     fetchedData?: {
         summary?: string;
-        lastUpdated?: string; // Store as string after JSON serialization
+        lastUpdated?: string;
     };
-    originalIndex: number; // Added index for mapping
+    originalIndex: number;
     // Phase 4 fields
     scrapingStatus?: 'Pending' | 'Scraping' | 'Success' | 'Failed_Scrape' | 'Failed_Error';
     scrapedText?: string | null;
-    scrapingErrorMessage?: string; // Phase 4 error
+    scrapingErrorMessage?: string;
+    // Phase 5 fields
+    summarizationStatus?: 'Pending_Summary' | 'Summarizing' | 'Success_Summary' | 'Failed_Summary';
+    summary?: string;
+    independenceCriteria?: "Yes" | "";
+    insufficientInfo?: "Yes" | "";
+    summarizationErrorMessage?: string;
 };
 
 
@@ -102,7 +109,10 @@ export default function Home() {
 
   // --- Phase 4 State ---
   const [isScraping, setIsScraping] = useState<boolean>(false);
-  const [scrapingErrors, setScrapingErrors] = useState<Record<number, string | null>>({}); // Store errors per row index
+  const [scrapingErrors, setScrapingErrors] = useState<Record<number, string | null>>({});
+
+  // --- Phase 5 State ---
+  const [isSummarizingAny, setIsSummarizingAny] = useState<boolean>(false);
 
 
   // --- Calculated State ---
@@ -112,16 +122,13 @@ export default function Home() {
 
 
   // --- Effects ---
-
-  // Effect to trigger AI header detection when headers are available
   useEffect(() => {
     if (rawHeaders.length > 0 && !confirmedHeaders && !aiSuggestedHeaders && !isDetectingHeaders && !isParsing) {
        callDetectHeaders();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [rawHeaders, confirmedHeaders, aiSuggestedHeaders, isDetectingHeaders, isParsing]); // Dependencies ensure this runs when headers are ready
+  }, [rawHeaders, confirmedHeaders, aiSuggestedHeaders, isDetectingHeaders, isParsing]);
 
-  // Effect to update manual selection when AI suggestions arrive
   useEffect(() => {
     if (aiSuggestedHeaders) {
       setManualHeaderSelection({
@@ -129,42 +136,37 @@ export default function Home() {
         countryHeader: aiSuggestedHeaders.countryHeader,
         websiteHeader: aiSuggestedHeaders.websiteHeader,
       });
-      setShowConfirmationUI(true); // Show confirmation UI once suggestions are loaded
+      setShowConfirmationUI(true);
     }
   }, [aiSuggestedHeaders]);
 
-  // --- API Calls ---
+  // Effect to manage isSummarizingAny based on processedRows
+  useEffect(() => {
+    const anyRowSummarizing = processedRows.some(row => row.summarizationStatus === 'Summarizing');
+    setIsSummarizingAny(anyRowSummarizing);
+  }, [processedRows]);
 
+
+  // --- API Calls ---
   const callDetectHeaders = async () => {
     if (!rawHeaders || rawHeaders.length === 0) return;
-    console.log("Calling detectHeaders function with headers:", rawHeaders);
     setIsDetectingHeaders(true);
     setDetectHeadersError(null);
-    setAiSuggestedHeaders(null); // Reset previous suggestions
-
+    setAiSuggestedHeaders(null);
     try {
       const response = await fetch(detectHeadersFunctionUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ headers: rawHeaders }), // Pass rawHeaders
+        body: JSON.stringify({ headers: rawHeaders }),
       });
-
       if (!response.ok) {
         let errorMsg = `Error detecting headers (Status: ${response.status})`;
-        try {
-            const errorData = await response.json();
-            if(errorData.error) errorMsg += `: ${errorData.error}`;
-        } catch (e) { /* ignore if response not json */ }
+        try { const errorData = await response.json(); if(errorData.error) errorMsg += `: ${errorData.error}`; } catch (e) { /* ignore */ }
         throw new Error(errorMsg);
       }
-
       const result: DetectHeadersOutput = await response.json();
-      console.log("Received AI suggestions:", result);
       setAiSuggestedHeaders(result);
-      // Manual selection state will be updated by the useEffect hook watching aiSuggestedHeaders
-
     } catch (error) {
-      console.error("Error calling detectHeaders function:", error);
       const message = error instanceof Error ? error.message : "Unknown error during header detection.";
       setDetectHeadersError(message);
     } finally {
@@ -173,12 +175,10 @@ export default function Home() {
   };
 
   // --- Event Handlers ---
-
   const handleFileUpload = async (event: ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (!file) return;
 
-    // Reset ALL states for a new file
     setFileName(file.name);
     setRawHeaders([]);
     setRawRows([]);
@@ -194,153 +194,99 @@ export default function Home() {
     setProcessedRows([]);
     setIsProcessingPhase3(false);
     setPhase3Error(null);
-    setIsScraping(false); // Reset scraping state
-    setScrapingErrors({}); // Reset scraping errors
-
+    setIsScraping(false);
+    setScrapingErrors({});
+    setIsSummarizingAny(false); // Reset summarization state
 
     const formData = new FormData();
     formData.append('file', file);
 
     try {
       const xhr = new XMLHttpRequest();
-
-      xhr.upload.onprogress = (event) => {
-        if (event.lengthComputable) {
-          const percentComplete = Math.round((event.loaded / event.total) * 100);
-          setUploadProgress(percentComplete);
-        }
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) setUploadProgress(Math.round((e.loaded / e.total) * 100));
       };
-
       xhr.open('POST', parseSheetFunctionUrl, true);
-
       xhr.onload = () => {
-        setIsParsing(false); // Parsing attempt finished
+        setIsParsing(false);
         if (xhr.status === 200) {
           try {
             const result = JSON.parse(xhr.responseText);
             if (result.error) {
-               setParseError(`Function Error: ${result.error}`);
-               setRawHeaders([]);
-               setRawRows([]);
+               setParseError(`Function Error: ${result.error}`); setRawHeaders([]); setRawRows([]);
             } else if (result.headers && result.rows) {
-              // Ensure headers are strings and rows are arrays of primitives/null
               const safeHeaders = result.headers.map((h: any) => String(h ?? ""));
-              const safeRows = result.rows.map((row: any[]) =>
-                  row.map(cell => (cell === undefined ? null : cell))
-              );
-              setRawHeaders(safeHeaders);
-              setRawRows(safeRows);
-              setParseError(null);
-              // AI detection will be triggered by useEffect watching rawHeaders
+              const safeRows = result.rows.map((row: any[]) => row.map(cell => (cell === undefined ? null : cell)));
+              setRawHeaders(safeHeaders); setRawRows(safeRows); setParseError(null);
             } else {
-              setParseError("Invalid response format from the parse function.");
-              setRawHeaders([]);
-              setRawRows([]);
+              setParseError("Invalid response format from the parse function."); setRawHeaders([]); setRawRows([]);
             }
           } catch (parseErr) {
-             console.error("Error parsing function response:", parseErr);
-             setParseError(`Failed to parse response from the function. Error: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`);
-             setRawHeaders([]);
-             setRawRows([]);
+             setParseError(`Failed to parse response. Error: ${parseErr instanceof Error ? parseErr.message : String(parseErr)}`); setRawHeaders([]); setRawRows([]);
           }
         } else {
-          console.error("Error calling parseSheet function:", xhr.statusText, xhr.responseText);
           let errorMessage = `Error calling parse function (Status: ${xhr.status})`;
-          try {
-             const errorResponse = JSON.parse(xhr.responseText);
-             if(errorResponse.error) errorMessage += `: ${errorResponse.error}`;
-          } catch (e) { /* Ignore if response is not JSON */ }
-          setParseError(errorMessage);
-          setRawHeaders([]);
-          setRawRows([]);
+          try { const errorResponse = JSON.parse(xhr.responseText); if(errorResponse.error) errorMessage += `: ${errorResponse.error}`; } catch (e) { /* Ignore */ }
+          setParseError(errorMessage); setRawHeaders([]); setRawRows([]);
         }
-         if (xhr.status !== 200) {
-            setUploadProgress(0);
-         }
+         if (xhr.status !== 200) setUploadProgress(0);
       };
-
       xhr.onerror = () => {
-        setIsParsing(false);
-        setUploadProgress(0);
-        console.error("Network error during upload:", xhr.statusText);
-        setParseError("Network error: Failed to connect to the parsing service.");
-        setRawHeaders([]);
-        setRawRows([]);
+        setIsParsing(false); setUploadProgress(0);
+        setParseError("Network error: Failed to connect to the parsing service."); setRawHeaders([]); setRawRows([]);
       };
-
       xhr.send(formData);
-
     } catch (err) {
-      setIsParsing(false);
-      setUploadProgress(0);
-      console.error("Error setting up the upload request:", err);
-      setParseError(`An unexpected error occurred during setup. Error: ${err instanceof Error ? err.message : String(err)}`);
-      setRawHeaders([]);
-      setRawRows([]);
+      setIsParsing(false); setUploadProgress(0);
+      setParseError(`An unexpected error occurred. Error: ${err instanceof Error ? err.message : String(err)}`); setRawHeaders([]); setRawRows([]);
     } finally {
-       if (event.target) {
-           event.target.value = '';
-       }
+       if (event.target) event.target.value = '';
     }
   };
 
   const handleManualHeaderChange = (key: HeaderMappingKey, value: string) => {
-     // Allow deselecting by mapping empty string value to null
      const selectedValue = value === "" ? null : value;
-     setManualHeaderSelection(prev => ({
-         ...prev,
-         [key]: selectedValue,
-     }));
+     setManualHeaderSelection(prev => ({ ...prev, [key]: selectedValue }));
   };
 
-  const handleConfirmHeaders = async () => { // Make async
+  const handleConfirmHeaders = async () => {
     const currentlyConfirmed = {
         name: manualHeaderSelection.companyNameHeader,
         country: manualHeaderSelection.countryHeader,
         website: manualHeaderSelection.websiteHeader,
     };
     setConfirmedHeaders(currentlyConfirmed);
-    setShowConfirmationUI(false); // Hide confirmation UI after confirming
-    console.log("Headers confirmed:", currentlyConfirmed);
+    setShowConfirmationUI(false);
 
-    // --- Trigger Phase 3 ---
-    setProcessedRows([]); // Clear previous results
+    setProcessedRows([]);
     setIsProcessingPhase3(true);
     setPhase3Error(null);
-    setIsScraping(false); // Ensure scraping state is reset
+    setIsScraping(false);
     setScrapingErrors({});
+    setIsSummarizingAny(false);
 
     try {
-        console.log("Calling normalizeAndCheck with:", { rows: rawRows, confirmedHeaders: currentlyConfirmed, headers: rawHeaders }); // Log headers
         const response = await fetch(normalizeAndCheckFunctionUrl, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ rows: rawRows, confirmedHeaders: currentlyConfirmed, headers: rawHeaders }), // Send headers too
+            body: JSON.stringify({ rows: rawRows, confirmedHeaders: currentlyConfirmed, headers: rawHeaders }),
         });
-
         if (!response.ok) {
             let errorMsg = `Error during normalization/check (Status: ${response.status})`;
-             try {
-                 const errorData = await response.json();
-                 if (errorData.error) errorMsg += `: ${errorData.error}`;
-             } catch (e) { /* ignore if response not json */ }
+             try { const errorData = await response.json(); if (errorData.error) errorMsg += `: ${errorData.error}`; } catch (e) { /* ignore */ }
              throw new Error(errorMsg);
         }
-
         const results: ProcessedRow[] = await response.json();
-         // Add originalIndex to map back easily
-         const resultsWithIndex = results.map((row, index) => ({
+         const resultsWithInitialStatus = results.map((row, index) => ({
             ...row,
             originalIndex: index,
-            // Initialize scraping status if not set by backend (e.g., if status is Fetched or Error)
             scrapingStatus: row.scrapingStatus ?? (row.status === 'To Process' ? 'Pending' : undefined),
+            summarizationStatus: (row.status === 'To Process' && (row.scrapingStatus ?? 'Pending') === 'Pending' && row.normalizedData.website)
+                                ? 'Pending_Summary'
+                                : undefined,
          }));
-        console.log("Received processed rows:", resultsWithIndex);
-        setProcessedRows(resultsWithIndex);
-        // Scraping will be triggered manually via button
-
+        setProcessedRows(resultsWithInitialStatus);
     } catch (error) {
-        console.error("Error calling normalizeAndCheck function:", error);
         const message = error instanceof Error ? error.message : "Unknown error during Phase 3 processing.";
         setPhase3Error(message);
     } finally {
@@ -351,22 +297,29 @@ export default function Home() {
   const handleScraping = async () => {
     if (!processedRows.length) return;
 
-    console.log("Starting scraping process...");
-    setIsScraping(true);
-    setScrapingErrors({}); // Clear previous errors
+    const rowsToScrapeExist = processedRows.some(row => row.status === 'To Process' && row.scrapingStatus === 'Pending' && row.normalizedData.website);
+    if (rowsToScrapeExist) {
+        setIsScraping(true); // Set scraping active only if there are rows to scrape
+    }
+    // Set summarizing active if any of those scraped rows will then be summarized
+    const rowsThatWillBeSummarized = processedRows.some(
+        row => row.status === 'To Process' && row.scrapingStatus === 'Pending' && row.normalizedData.website
+    );
+    if (rowsThatWillBeSummarized) {
+        setIsSummarizingAny(true);
+    }
 
-    // Create a copy to modify and update state progressively
+
+    setScrapingErrors({});
     let updatedRows = [...processedRows];
 
-    // Collect promises for all scraping calls
     const scrapingPromises = updatedRows.map(async (row, index) => {
         if (row.status === 'To Process' && row.normalizedData.website && row.scrapingStatus === 'Pending') {
-            // Update UI immediately to show 'Scraping'
             updatedRows[index] = { ...row, scrapingStatus: 'Scraping' };
-            setProcessedRows([...updatedRows]); // Update state to show 'Scraping'
+            setProcessedRows([...updatedRows]);
 
             try {
-                const response = await fetch(scrapeWebsiteContentFunctionUrl, {
+                const scrapeResponse = await fetch(scrapeWebsiteContentFunctionUrl, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
@@ -374,74 +327,102 @@ export default function Home() {
                         companyName: row.originalData.companyName,
                     }),
                 });
+                const scrapeResult: ScrapeResult = await scrapeResponse.json();
+                if (!scrapeResponse.ok) { // Check response.ok here for scrape
+                     updatedRows[index] = {
+                        ...updatedRows[index],
+                        scrapingStatus: scrapeResult.status || 'Failed_Error', // Use status from backend if available
+                        scrapingErrorMessage: scrapeResult.error || `Scraping failed (Status: ${scrapeResponse.status})`,
+                        summarizationStatus: 'Failed_Summary', // Fail summary if scrape fails
+                        summarizationErrorMessage: 'Scraping failed, cannot summarize.',
+                     };
+                } else if (scrapeResult.status === 'Success' && scrapeResult.scrapedText) {
+                    updatedRows[index] = {
+                        ...updatedRows[index],
+                        scrapingStatus: 'Success',
+                        scrapedText: scrapeResult.scrapedText,
+                        summarizationStatus: 'Summarizing', // Set to summarizing
+                    };
+                    setProcessedRows([...updatedRows]); // Update UI to show 'Summarizing'
 
-                if (!response.ok) {
-                    let errorMsg = `Scraping failed (Status: ${response.status})`;
-                    let resultStatus : ProcessedRow['scrapingStatus'] = 'Failed_Error';
+                    // Now, call summarization
                     try {
-                        const errorData = await response.json();
-                         if(errorData.error) errorMsg += `: ${errorData.error}`;
-                         if(errorData.status) resultStatus = errorData.status; // Use status from backend if available
-                    } catch (e) { /* ignore if response not json */ }
-                    throw new Error(errorMsg);
+                        const summarizeResponse = await fetch(processAndSummarizeContentFunctionUrl, {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ scrapedText: scrapeResult.scrapedText }),
+                        });
+                        const summaryResult: SummarizeContentOutput = await summarizeResponse.json();
+
+                        if (!summarizeResponse.ok) { // Check response.ok for summarize
+                             updatedRows[index] = {
+                                ...updatedRows[index],
+                                summarizationStatus: 'Failed_Summary',
+                                summarizationErrorMessage: (summaryResult as any).error || `Summarization failed (Status: ${summarizeResponse.status})`,
+                             };
+                        } else {
+                             updatedRows[index] = {
+                                ...updatedRows[index],
+                                summarizationStatus: 'Success_Summary',
+                                summary: summaryResult.summary,
+                                independenceCriteria: summaryResult.independenceCriteria,
+                                insufficientInfo: summaryResult.insufficientInfo,
+                             };
+                        }
+                    } catch (summaryError) {
+                        const message = summaryError instanceof Error ? summaryError.message : "Unknown summarization error.";
+                        updatedRows[index] = {
+                            ...updatedRows[index],
+                            summarizationStatus: 'Failed_Summary',
+                            summarizationErrorMessage: message,
+                        };
+                    }
+                } else { // Scraping "succeeded" but no text or other fail status
+                    updatedRows[index] = {
+                        ...updatedRows[index],
+                        scrapingStatus: scrapeResult.status || 'Failed_Scrape',
+                        scrapedText: null,
+                        scrapingErrorMessage: scrapeResult.error || 'No significant content found.',
+                        summarizationStatus: 'Failed_Summary',
+                        summarizationErrorMessage: 'No content to summarize.',
+                    };
                 }
-
-                const result: ScrapeResult = await response.json();
-                console.log(`Scraping result for row ${row.originalIndex}:`, result);
-
-                // Update the specific row in the copied array
-                 updatedRows[index] = {
-                    ...updatedRows[index],
-                    scrapingStatus: result.status, // 'Success', 'Failed_Scrape', 'Failed_Error'
-                    scrapedText: result.scrapedText,
-                    scrapingErrorMessage: result.error,
-                 };
-
-            } catch (error) {
-                console.error(`Error scraping website for row ${row.originalIndex}:`, error);
-                 const message = error instanceof Error ? error.message : "Unknown scraping error.";
+            } catch (error) { // Catch for scrape fetch or initial processing
+                const message = error instanceof Error ? error.message : "Unknown scraping error.";
                  updatedRows[index] = {
                     ...updatedRows[index],
                     scrapingStatus: 'Failed_Error',
                     scrapedText: null,
                     scrapingErrorMessage: message,
+                    summarizationStatus: 'Failed_Summary',
+                    summarizationErrorMessage: 'Scraping error, cannot summarize.',
                  };
-                // Update scraping errors state
                 setScrapingErrors(prev => ({ ...prev, [row.originalIndex]: message }));
             } finally {
-                 // Update state after each row finishes to show progress
                  setProcessedRows([...updatedRows]);
             }
         }
-        // Return void or a marker, not modifying original array directly
         return;
     });
 
-    // Wait for all scraping attempts to finish (or fail)
     await Promise.allSettled(scrapingPromises);
-
-    console.log("Scraping process finished.");
     setIsScraping(false);
+    // isSummarizingAny will be updated by the useEffect hook
 };
 
 
   // --- Rendering Logic ---
-
    const renderCellContent = (cellData: string | number | boolean | Date | null): React.ReactNode => {
-    // Simplified: Convert all to string or empty string for display
     return cellData !== null && cellData !== undefined ? String(cellData) : '';
   };
 
-  // Helper to get highlight class based on confirmed or suggested headers
   const getHighlightClass = (header: string): string => {
      const currentSelection = confirmedHeaders ? {
          companyNameHeader: confirmedHeaders.name,
          countryHeader: confirmedHeaders.country,
          websiteHeader: confirmedHeaders.website
-     } : manualHeaderSelection; // Use manual selection for highlighting before confirmation
-
+     } : manualHeaderSelection;
       if (!currentSelection) return "";
-
       if (header === currentSelection.companyNameHeader) return "bg-blue-100 dark:bg-blue-900/30 font-semibold";
       if (header === currentSelection.countryHeader) return "bg-green-100 dark:bg-green-900/30 font-semibold";
       if (header === currentSelection.websiteHeader) return "bg-yellow-100 dark:bg-yellow-900/30 font-semibold";
@@ -450,8 +431,7 @@ export default function Home() {
 
   const renderHeaderSelector = (label: string, mappingKey: HeaderMappingKey) => {
     const aiSuggestion = aiSuggestedHeaders?.[mappingKey] ?? null;
-    const currentValue = manualHeaderSelection[mappingKey] ?? ""; // Use empty string for Select value when null
-
+    const currentValue = manualHeaderSelection[mappingKey] ?? "";
     return (
         <div className="grid grid-cols-3 items-center gap-4">
             <Label htmlFor={`select-${mappingKey}`} className="text-right font-medium">{label}:</Label>
@@ -459,7 +439,7 @@ export default function Home() {
                  <Select
                     value={currentValue}
                     onValueChange={(value) => handleManualHeaderChange(mappingKey, value)}
-                    disabled={!rawHeaders.length || isDetectingHeaders || isProcessingPhase3 || isScraping}
+                    disabled={!rawHeaders.length || isDetectingHeaders || isProcessingPhase3 || isScraping || isSummarizingAny}
                 >
                     <SelectTrigger id={`select-${mappingKey}`} className="w-full">
                         <SelectValue placeholder="Select Header..." />
@@ -477,184 +457,135 @@ export default function Home() {
                  {aiSuggestion && currentValue === aiSuggestion && (
                      <CheckCircle className="h-4 w-4 text-green-500 ml-1 shrink-0" title={`AI suggested: ${aiSuggestion}`} />
                  )}
-                 {!aiSuggestion && currentValue && ( // User selected something, AI didn't suggest
+                 {!aiSuggestion && currentValue && (
                      <FileCheck2 className="h-4 w-4 text-blue-500 ml-1 shrink-0" title="Manually selected"/>
-                 )}
-                  {!aiSuggestion && !currentValue && ( // Nothing selected, nothing suggested
+                  )}
+                  {!aiSuggestion && !currentValue && (
                      <XCircle className="h-4 w-4 text-muted-foreground ml-1 shrink-0" title="No suggestion"/>
                   )}
             </div>
-
         </div>
     );
 };
 
  const renderStatusBadge = (status: ProcessedRow['status']) => {
       switch (status) {
-          case 'Fetched':
-              return <Badge variant="secondary" className="bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">Fetched</Badge>;
-          case 'To Process':
-              return <Badge variant="outline" className="border-blue-400 text-blue-700 dark:border-blue-600 dark:text-blue-400">To Process</Badge>;
-          case 'Error':
-              return <Badge variant="destructive">Error</Badge>;
-          default:
-              return <Badge variant="secondary">Unknown</Badge>;
+          case 'Fetched': return <Badge variant="secondary" className="bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300">Fetched</Badge>;
+          case 'To Process': return <Badge variant="outline" className="border-blue-400 text-blue-700 dark:border-blue-600 dark:text-blue-400">To Process</Badge>;
+          case 'Error': return <Badge variant="destructive">Error</Badge>;
+          default: return <Badge variant="secondary">Unknown</Badge>;
       }
   };
 
  const renderScrapingStatus = (row: ProcessedRow) => {
-     if (!row.scrapingStatus || row.status === 'Fetched' || row.status === 'Error') {
-         return <span className="text-xs text-muted-foreground italic">N/A</span>; // Not applicable if Fetched or Error in Phase 3
+     if (!row.scrapingStatus || row.status === 'Fetched' || (row.status === 'Error' && !row.scrapingErrorMessage)) {
+         return <span className="text-xs text-muted-foreground italic">N/A</span>;
      }
-
      const error = scrapingErrors[row.originalIndex];
-
      switch (row.scrapingStatus) {
-         case 'Pending':
-             return <Badge variant="outline">Pending Scrape</Badge>;
-         case 'Scraping':
-             return (
-                 <Badge variant="secondary" className="animate-pulse">
-                     <Loader2 className="mr-1 h-3 w-3 animate-spin" />
-                     Scraping...
-                 </Badge>
-             );
+         case 'Pending': return <Badge variant="outline">Pending Scrape</Badge>;
+         case 'Scraping': return <Badge variant="secondary" className="animate-pulse"><Loader2 className="mr-1 h-3 w-3 animate-spin" />Scraping...</Badge>;
          case 'Success':
              return (
                  <TooltipProvider>
-                     <Tooltip>
-                         <TooltipTrigger asChild>
-                             <Badge variant="secondary" className="bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300 cursor-help">
-                                 <CheckCircle className="mr-1 h-3 w-3" /> Scraped
-                             </Badge>
-                         </TooltipTrigger>
-                         <TooltipContent>
-                             <p className="max-w-xs text-xs">
-                                 {row.scrapedText ? `Length: ${row.scrapedText.length}` : 'No text scraped.'}
-                             </p>
-                         </TooltipContent>
-                     </Tooltip>
+                     <Tooltip><TooltipTrigger asChild><Badge variant="secondary" className="bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300 cursor-help"><CheckCircle className="mr-1 h-3 w-3" /> Scraped</Badge></TooltipTrigger><TooltipContent><p className="max-w-xs text-xs">{row.scrapedText ? `Length: ${row.scrapedText.length}` : 'No text scraped.'}</p></TooltipContent></Tooltip>
                  </TooltipProvider>
              );
-         case 'Failed_Scrape':
-         case 'Failed_Error':
+         case 'Failed_Scrape': case 'Failed_Error':
+             return (
+                 <TooltipProvider>
+                     <Tooltip><TooltipTrigger asChild><Badge variant="destructive" className="cursor-help"><XCircle className="mr-1 h-3 w-3" /> Failed</Badge></TooltipTrigger><TooltipContent><p className="max-w-xs text-xs">{row.scrapingErrorMessage || error || 'Scraping failed.'}</p></TooltipContent></Tooltip>
+                 </TooltipProvider>
+             );
+         default: return <Badge variant="secondary">Unknown</Badge>;
+     }
+ };
+
+ const renderSummarizationStatus = (row: ProcessedRow) => {
+    if (!row.summarizationStatus || row.scrapingStatus !== 'Success' ) {
+         if (row.status === 'Fetched' || (row.status === 'Error' && !row.summarizationErrorMessage)) return <span className="text-xs text-muted-foreground italic">N/A</span>;
+         if (row.scrapingStatus === 'Failed_Error' || row.scrapingStatus === 'Failed_Scrape') return <Badge variant="outline" className="border-orange-400 text-orange-700 dark:border-orange-600 dark:text-orange-400">Not Summarized</Badge>;
+    }
+
+     switch (row.summarizationStatus) {
+         case 'Pending_Summary': return <Badge variant="outline">Pending Summary</Badge>;
+         case 'Summarizing': return <Badge variant="secondary" className="animate-pulse"><Loader2 className="mr-1 h-3 w-3 animate-spin" />Summarizing...</Badge>;
+         case 'Success_Summary':
              return (
                  <TooltipProvider>
                      <Tooltip>
                          <TooltipTrigger asChild>
-                             <Badge variant="destructive" className="cursor-help">
-                                <XCircle className="mr-1 h-3 w-3" /> Failed
+                            <Badge variant="secondary" className="bg-teal-100 text-teal-800 dark:bg-teal-900/30 dark:text-teal-300 cursor-help flex flex-col items-start gap-0.5 py-1">
+                                 <div className="flex items-center">
+                                     <MessageSquareQuote className="mr-1 h-3 w-3" /> Summarized
+                                 </div>
+                                 {row.independenceCriteria === "Yes" && <div className="flex items-center text-xs"><ShieldQuestion className="mr-1 h-3 w-3 text-amber-600 dark:text-amber-400" /><span>May Not Be Indep.</span></div>}
+                                 {row.insufficientInfo === "Yes" && <div className="flex items-center text-xs"><FileWarning className="mr-1 h-3 w-3 text-rose-600 dark:text-rose-400"/><span>Low Info</span></div>}
                              </Badge>
                          </TooltipTrigger>
-                         <TooltipContent>
-                             <p className="max-w-xs text-xs">{row.scrapingErrorMessage || error || 'Scraping failed.'}</p>
+                         <TooltipContent className="max-w-md">
+                             <p className="text-sm font-semibold mb-1">Summary:</p>
+                             <p className="text-xs mb-2">{row.summary || 'No summary available.'}</p>
+                             {row.independenceCriteria === "Yes" && <p className="text-xs text-amber-700 dark:text-amber-300 mb-1">Potential Independence Issue: Company may be government-owned, non-profit, or a subsidiary.</p>}
+                             {row.insufficientInfo === "Yes" && <p className="text-xs text-rose-700 dark:text-rose-300">Insufficient Information: The website text was broken, irrelevant, or too minimal for full analysis.</p>}
                          </TooltipContent>
                      </Tooltip>
                  </TooltipProvider>
              );
-         default:
-             return <Badge variant="secondary">Unknown</Badge>;
+         case 'Failed_Summary':
+             return (
+                 <TooltipProvider>
+                     <Tooltip><TooltipTrigger asChild><Badge variant="destructive" className="cursor-help"><XCircle className="mr-1 h-3 w-3" /> Failed</Badge></TooltipTrigger><TooltipContent><p className="max-w-xs text-xs">{row.summarizationErrorMessage || 'Summarization failed.'}</p></TooltipContent></Tooltip>
+                 </TooltipProvider>
+             );
+         default: return <span className="text-xs text-muted-foreground italic">N/A</span>;
      }
  };
 
 
   return (
     <main className="flex min-h-screen flex-col items-center p-6 md:p-12 lg:p-24 bg-background">
-        <TooltipProvider> {/* Wrap main content */}
-      <div className="w-full max-w-7xl space-y-8"> {/* Increased max-width */}
-        {/* --- File Upload Card --- */}
+        <TooltipProvider>
+      <div className="w-full max-w-7xl space-y-8">
         <Card className="shadow-md">
           <CardHeader>
             <CardTitle className="text-2xl font-semibold">Overviewer 3</CardTitle>
-            <CardDescription>Upload an XLSX file, confirm headers, check processing status, and initiate scraping.</CardDescription>
+            <CardDescription>Upload an XLSX file, confirm headers, process, scrape, and summarize company data.</CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
             <div className="space-y-2">
-               <Label htmlFor="file-upload" className={`file-input-label ${isParsing || isProcessingPhase3 || isScraping ? 'opacity-50 cursor-not-allowed' : ''}`}>
+               <Label htmlFor="file-upload" className={`file-input-label ${isParsing || isProcessingPhase3 || isScraping || isSummarizingAny ? 'opacity-50 cursor-not-allowed' : ''}`}>
                 <Upload className="mr-2 h-4 w-4" /> {fileName || 'Choose XLSX File'}
               </Label>
-              <Input
-                id="file-upload"
-                type="file"
-                accept=".xlsx, application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                onChange={handleFileUpload}
-                className="file-input"
-                disabled={isParsing || isProcessingPhase3 || isScraping} // Disable during all processing phases
-              />
+              <Input id="file-upload" type="file" accept=".xlsx" onChange={handleFileUpload} className="file-input" disabled={isParsing || isProcessingPhase3 || isScraping || isSummarizingAny} />
             </div>
-             {isParsing && (
-                <div className="space-y-2">
-                    <Progress value={uploadProgress} className="w-full" />
-                    <p className="text-sm text-muted-foreground text-center">{uploadProgress > 0 && uploadProgress < 100 ? `${uploadProgress}% Uploaded` : "Processing file..."}</p>
-                </div>
-             )}
-            {parseError && (
-                 <Alert variant="destructive">
-                  <Terminal className="h-4 w-4" />
-                  <AlertTitle>Parsing Error</AlertTitle>
-                  <AlertDescription>
-                    {parseError}
-                  </AlertDescription>
-                </Alert>
-            )}
+             {isParsing && (<div className="space-y-2"><Progress value={uploadProgress} className="w-full" /><p className="text-sm text-muted-foreground text-center">{uploadProgress > 0 && uploadProgress < 100 ? `${uploadProgress}% Uploaded` : "Processing file..."}</p></div>)}
+            {parseError && (<Alert variant="destructive"><Terminal className="h-4 w-4" /><AlertTitle>Parsing Error</AlertTitle><AlertDescription>{parseError}</AlertDescription></Alert>)}
           </CardContent>
         </Card>
 
-         {/* --- Header Confirmation Card --- */}
          {rawHeaders.length > 0 && !confirmedHeaders && showConfirmationUI && (
              <Card className="shadow-md">
-                 <CardHeader>
-                     <CardTitle>Confirm Column Headers</CardTitle>
-                     <CardDescription>
-                        AI has suggested the following columns. Please review and confirm or correct the mapping before proceeding.
-                     </CardDescription>
-                 </CardHeader>
+                 <CardHeader><CardTitle>Confirm Column Headers</CardTitle><CardDescription>AI has suggested columns. Review and confirm/correct the mapping.</CardDescription></CardHeader>
                  <CardContent className="space-y-4">
-                    {isDetectingHeaders && (
-                         <div className="flex items-center justify-center space-x-2 p-4">
-                             <Loader2 className="h-5 w-5 animate-spin" />
-                             <span>Detecting headers...</span>
-                         </div>
-                     )}
-                    {detectHeadersError && (
-                         <Alert variant="destructive">
-                          <Terminal className="h-4 w-4" />
-                          <AlertTitle>Header Detection Error</AlertTitle>
-                          <AlertDescription>
-                            {detectHeadersError}
-                          </AlertDescription>
-                        </Alert>
-                    )}
-                     {!isDetectingHeaders && aiSuggestedHeaders && ( // Only show selectors when suggestions are ready
+                    {isDetectingHeaders && (<div className="flex items-center justify-center space-x-2 p-4"><Loader2 className="h-5 w-5 animate-spin" /><span>Detecting headers...</span></div>)}
+                    {detectHeadersError && (<Alert variant="destructive"><Terminal className="h-4 w-4" /><AlertTitle>Header Detection Error</AlertTitle><AlertDescription>{detectHeadersError}</AlertDescription></Alert>)}
+                     {!isDetectingHeaders && aiSuggestedHeaders && (
                          <>
                              {renderHeaderSelector("Company Name", "companyNameHeader")}
                              {renderHeaderSelector("Country", "countryHeader")}
                              {renderHeaderSelector("Website URL", "websiteHeader")}
-
                               <Separator />
-
                               <div className="flex justify-end">
-                                 <Button onClick={handleConfirmHeaders} disabled={isDetectingHeaders || isProcessingPhase3 || isScraping}>
+                                 <Button onClick={handleConfirmHeaders} disabled={isDetectingHeaders || isProcessingPhase3 || isScraping || isSummarizingAny}>
                                      <CheckCircle className="mr-2 h-4 w-4" /> Confirm & Process
                                  </Button>
                              </div>
                          </>
                      )}
-                     {/* Loading Skeleton for AI suggestions */}
                       {isDetectingHeaders && (
                          <div className="space-y-4">
-                           <div className="grid grid-cols-3 items-center gap-4">
-                               <Skeleton className="h-5 w-20 justify-self-end" />
-                               <div className="col-span-2 flex items-center gap-2"><Skeleton className="h-9 w-full" /></div>
-                           </div>
-                           <div className="grid grid-cols-3 items-center gap-4">
-                               <Skeleton className="h-5 w-16 justify-self-end" />
-                               <div className="col-span-2 flex items-center gap-2"><Skeleton className="h-9 w-full" /></div>
-                           </div>
-                           <div className="grid grid-cols-3 items-center gap-4">
-                               <Skeleton className="h-5 w-24 justify-self-end" />
-                               <div className="col-span-2 flex items-center gap-2"><Skeleton className="h-9 w-full" /></div>
-                           </div>
+                           {[1,2,3].map(i => (<div key={i} className="grid grid-cols-3 items-center gap-4"><Skeleton className="h-5 w-20 justify-self-end" /><div className="col-span-2 flex items-center gap-2"><Skeleton className="h-9 w-full" /></div></div>))}
                            <Separator />
                            <div className="flex justify-end"><Skeleton className="h-10 w-40" /></div>
                        </div>
@@ -663,77 +594,35 @@ export default function Home() {
              </Card>
          )}
 
+         {isProcessingPhase3 && (<Card className="shadow-md"><CardContent className="p-6 flex items-center justify-center space-x-3"><Loader2 className="h-6 w-6 animate-spin text-primary" /><span className="text-lg font-medium">Normalizing and checking data...</span></CardContent></Card>)}
+         {phase3Error && (<Alert variant="destructive"><AlertCircle className="h-4 w-4" /><AlertTitle>Processing Error (Phase 3)</AlertTitle><AlertDescription>{phase3Error}</AlertDescription></Alert>)}
 
-        {/* --- Phase 3 Processing Indicator & Error --- */}
-         {isProcessingPhase3 && (
-             <Card className="shadow-md">
-                 <CardContent className="p-6 flex items-center justify-center space-x-3">
-                     <Loader2 className="h-6 w-6 animate-spin text-primary" />
-                     <span className="text-lg font-medium">Normalizing and checking data against Firestore...</span>
-                 </CardContent>
-             </Card>
-         )}
-         {phase3Error && (
-             <Alert variant="destructive">
-              <AlertCircle className="h-4 w-4" />
-              <AlertTitle>Processing Error (Phase 3)</AlertTitle>
-              <AlertDescription>
-                {phase3Error}
-              </AlertDescription>
-            </Alert>
-         )}
-
-        {/* --- Scraping Trigger Card --- */}
          {confirmedHeaders && !isProcessingPhase3 && !phase3Error && rowsToProcessCount > 0 && (
              <Card className="shadow-md">
-                 <CardHeader>
-                     <CardTitle>Web Scraping</CardTitle>
-                     <CardDescription>
-                         {rowsToProcessCount} {rowsToProcessCount === 1 ? 'row needs' : 'rows need'} web content scraping.
-                     </CardDescription>
-                 </CardHeader>
-                 <CardContent>
-                     <p className="text-sm text-muted-foreground mb-4">
-                         Click the button below to attempt scraping the website content for rows marked 'To Process'.
-                         This may take some time depending on the number of websites.
-                     </p>
-                 </CardContent>
+                 <CardHeader><CardTitle>Web Scraping & Summarization</CardTitle><CardDescription>{rowsToProcessCount} {rowsToProcessCount === 1 ? 'row needs' : 'rows need'} web content scraping and AI summarization.</CardDescription></CardHeader>
+                 <CardContent><p className="text-sm text-muted-foreground mb-4">Click to attempt scraping & summarizing for rows marked 'To Process'. This may take time.</p></CardContent>
                  <CardFooter className="flex justify-end">
-                     <Button onClick={handleScraping} disabled={isScraping || isProcessingPhase3}>
-                         {isScraping ? (
-                             <Loader2 className="mr-2 h-4 w-4 animate-spin" />
-                         ) : (
-                             <SearchCode className="mr-2 h-4 w-4" />
-                         )}
-                         {isScraping ? 'Scraping in Progress...' : `Start Scraping (${rowsToProcessCount})`}
+                     <Button onClick={handleScraping} disabled={isScraping || isProcessingPhase3 || isSummarizingAny}>
+                         {(isScraping || isSummarizingAny) ? <Loader2 className="mr-2 h-4 w-4 animate-spin" /> : <SearchCode className="mr-2 h-4 w-4" />}
+                         {(isScraping || isSummarizingAny) ? 'Processing Web Content...' : `Start Scraping & Summarizing (${rowsToProcessCount})`}
                      </Button>
                  </CardFooter>
              </Card>
          )}
-          {/* Scraping Summary Info */}
          {confirmedHeaders && !isProcessingPhase3 && processedRows.length > 0 && (rowsSuccessfullyScrapedCount > 0 || rowsFailedScrapeCount > 0) && (
             <Alert variant="default" className="mt-4">
-                 <Bot className="h-4 w-4" />
-                 <AlertTitle>Scraping Summary</AlertTitle>
-                 <AlertDescription>
-                     Successfully scraped: {rowsSuccessfullyScrapedCount} | Failed: {rowsFailedScrapeCount}
-                 </AlertDescription>
+                 <Bot className="h-4 w-4" /><AlertTitle>Processing Summary</AlertTitle>
+                 <AlertDescription>Successfully scraped: {rowsSuccessfullyScrapedCount} | Failed to scrape: {rowsFailedScrapeCount}</AlertDescription>
+                 <AlertDescription>Summarized: {processedRows.filter(r => r.summarizationStatus === 'Success_Summary').length} | Failed to summarize: {processedRows.filter(r => r.summarizationStatus === 'Failed_Summary').length}</AlertDescription>
              </Alert>
          )}
 
-
-        {/* --- Data Table Card --- */}
         {rawHeaders.length > 0 && rawRows.length > 0 && (
           <Card className="shadow-md">
             <CardHeader>
               <CardTitle>File Contents: {fileName}</CardTitle>
               <CardDescription>
-                {confirmedHeaders
-                    ? `Displaying ${processedRows.length > 0 ? processedRows.length : rawRows.length} rows with processing & scraping status.`
-                    : (aiSuggestedHeaders
-                        ? "Highlighting suggested columns. Please confirm above."
-                        : "Awaiting header confirmation.")
-                }
+                {confirmedHeaders ? `Displaying ${processedRows.length > 0 ? processedRows.length : rawRows.length} rows with processing, scraping & summarization status.` : (aiSuggestedHeaders ? "Highlighting suggested columns. Confirm above." : "Awaiting header confirmation.")}
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -741,24 +630,14 @@ export default function Home() {
                 <Table>
                   <TableHeader className="sticky top-0 bg-card z-10 shadow-sm">
                     <TableRow>
-                       {/* Add Status & Scraping columns if headers are confirmed */}
                        {confirmedHeaders && (
                            <>
                             <TableHead className="font-bold w-[130px] sticky left-0 bg-card z-20">Status</TableHead>
                             <TableHead className="font-bold w-[130px]">Scraping</TableHead>
+                            <TableHead className="font-bold w-[150px]">AI Summary</TableHead> {/* New Column */}
                            </>
                        )}
-                       {rawHeaders.map((header, index) => (
-                         <TableHead
-                            key={`${header}-${index}`}
-                            className={cn(
-                                "font-semibold whitespace-nowrap", // Make headers bold
-                                getHighlightClass(header) // Apply highlighting
-                            )}
-                         >
-                           {header}
-                         </TableHead>
-                       ))}
+                       {rawHeaders.map((header, index) => (<TableHead key={`${header}-${index}`} className={cn("font-semibold whitespace-nowrap", getHighlightClass(header))}>{header}</TableHead>))}
                     </TableRow>
                   </TableHeader>
                   <TableBody>
@@ -766,90 +645,28 @@ export default function Home() {
                          const isProcessed = (item as ProcessedRow).originalIndex !== undefined;
                          const rowData = isProcessed ? rawRows[(item as ProcessedRow).originalIndex] : item as ExcelRow;
                          const processedInfo = isProcessed ? (item as ProcessedRow) : null;
-
                          return (
-                              <TableRow
-                                key={processedInfo?.originalIndex ?? rowIndex}
-                                className={cn(
-                                    processedInfo?.status === 'Fetched' ? 'opacity-70' : '',
-                                    (processedInfo?.scrapingStatus === 'Scraping') ? 'animate-pulse bg-muted/50' : '' // Pulse during scraping
-                                 )}
-                              >
-                                {confirmedHeaders && ( // Display status cells only after confirmation
+                              <TableRow key={processedInfo?.originalIndex ?? rowIndex} className={cn(processedInfo?.status === 'Fetched' ? 'opacity-70' : '', (processedInfo?.scrapingStatus === 'Scraping' || processedInfo?.summarizationStatus === 'Summarizing') ? 'animate-pulse bg-muted/50' : '')}>
+                                {confirmedHeaders && (
                                      <>
-                                     {/* Phase 3 Status Cell (Sticky) */}
                                      <TableCell className="font-medium align-top sticky left-0 bg-card z-20 border-r">
-                                        {processedInfo ? (
-                                            <div className="flex flex-col items-start gap-1 w-[110px]">
-                                                {renderStatusBadge(processedInfo.status)}
-                                                 {processedInfo.status === 'Fetched' && processedInfo.fetchedData?.summary && (
-                                                     <Tooltip>
-                                                         <TooltipTrigger asChild>
-                                                            <span className="text-xs text-muted-foreground truncate cursor-help">
-                                                                Summary: {processedInfo.fetchedData.summary}
-                                                            </span>
-                                                          </TooltipTrigger>
-                                                          <TooltipContent>
-                                                              <p className="max-w-xs text-xs">{processedInfo.fetchedData.summary}</p>
-                                                          </TooltipContent>
-                                                     </Tooltip>
-                                                 )}
-                                                {processedInfo.status === 'Error' && processedInfo.errorMessage && (
-                                                    <Tooltip>
-                                                        <TooltipTrigger asChild>
-                                                            <span className="text-xs text-destructive truncate cursor-help">
-                                                                {processedInfo.errorMessage}
-                                                            </span>
-                                                        </TooltipTrigger>
-                                                        <TooltipContent>
-                                                            <p className="max-w-xs text-xs">{processedInfo.errorMessage}</p>
-                                                        </TooltipContent>
-                                                    </Tooltip>
-                                                 )}
-                                            </div>
-                                        ) : isProcessingPhase3 ? (
-                                             <Skeleton className="h-5 w-20" />
-                                        ) : (
-                                             <Badge variant="outline">Pending</Badge>
-                                        )}
+                                        {processedInfo ? (<div className="flex flex-col items-start gap-1 w-[110px]">{renderStatusBadge(processedInfo.status)} {processedInfo.status === 'Fetched' && processedInfo.fetchedData?.summary && (<Tooltip><TooltipTrigger asChild><span className="text-xs text-muted-foreground truncate cursor-help">Summary: {processedInfo.fetchedData.summary}</span></TooltipTrigger><TooltipContent><p className="max-w-xs text-xs">{processedInfo.fetchedData.summary}</p></TooltipContent></Tooltip>)} {processedInfo.status === 'Error' && processedInfo.errorMessage && (<Tooltip><TooltipTrigger asChild><span className="text-xs text-destructive truncate cursor-help">{processedInfo.errorMessage}</span></TooltipTrigger><TooltipContent><p className="max-w-xs text-xs">{processedInfo.errorMessage}</p></TooltipContent></Tooltip>)}</div>) : isProcessingPhase3 ? (<Skeleton className="h-5 w-20" />) : (<Badge variant="outline">Pending</Badge>)}
                                      </TableCell>
-                                     {/* Phase 4 Scraping Status Cell */}
                                      <TableCell className="font-medium align-top">
-                                         {processedInfo ? (
-                                              <div className="w-[110px]">
-                                                 {renderScrapingStatus(processedInfo)}
-                                              </div>
-                                         ) : isProcessingPhase3 ? (
-                                             <Skeleton className="h-5 w-20" />
-                                         ) : (
-                                             <span className="text-xs text-muted-foreground italic">N/A</span>
-                                         )}
+                                         {processedInfo ? (<div className="w-[110px]">{renderScrapingStatus(processedInfo)}</div>) : isProcessingPhase3 ? (<Skeleton className="h-5 w-20" />) : (<span className="text-xs text-muted-foreground italic">N/A</span>)}
+                                     </TableCell>
+                                     <TableCell className="font-medium align-top"> {/* New Cell */}
+                                         {processedInfo ? (<div className="w-[130px]">{renderSummarizationStatus(processedInfo)}</div>) : (isProcessingPhase3 || isScraping || isSummarizingAny) ? (<Skeleton className="h-5 w-24" />) : (<span className="text-xs text-muted-foreground italic">N/A</span>)}
                                      </TableCell>
                                      </>
                                  )}
-                                 {rawHeaders.map((header, cellIndex) => (
-                                   <TableCell
-                                       key={`${header}-${cellIndex}`}
-                                       className={cn(
-                                           "whitespace-normal break-words align-top",
-                                            getHighlightClass(header)
-                                        )}
-                                    >
-                                     {renderCellContent(rowData[cellIndex] !== undefined ? rowData[cellIndex] : null)}
-                                   </TableCell>
-                                 ))}
+                                 {rawHeaders.map((header, cellIndex) => (<TableCell key={`${header}-${cellIndex}`} className={cn("whitespace-normal break-words align-top", getHighlightClass(header))}>{renderCellContent(rowData[cellIndex] !== undefined ? rowData[cellIndex] : null)}</TableCell>))}
                               </TableRow>
                          );
                      })}
-                     {/* Show skeleton rows if processing phase 3 started but no results yet */}
                      {isProcessingPhase3 && processedRows.length === 0 && rawRows.slice(0, 5).map((_, idx) => (
                          <TableRow key={`skeleton-${idx}`}>
-                             {confirmedHeaders && (
-                                <>
-                                 <TableCell><Skeleton className="h-5 w-20" /></TableCell>
-                                 <TableCell><Skeleton className="h-5 w-20" /></TableCell>
-                                </>
-                             )}
+                             {confirmedHeaders && (<><TableCell><Skeleton className="h-5 w-20" /></TableCell><TableCell><Skeleton className="h-5 w-20" /></TableCell><TableCell><Skeleton className="h-5 w-24" /></TableCell></>)}
                              {rawHeaders.map((h, hIdx) => <TableCell key={`sk-cell-${hIdx}`}><Skeleton className="h-5 w-full" /></TableCell>)}
                          </TableRow>
                      ))}
@@ -861,7 +678,7 @@ export default function Home() {
           </Card>
         )}
       </div>
-      </TooltipProvider> {/* Close TooltipProvider */}
+      </TooltipProvider>
     </main>
   );
 }

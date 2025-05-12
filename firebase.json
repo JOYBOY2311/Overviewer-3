@@ -42,6 +42,10 @@
          "function": "scrapeWebsiteContent"
        },
        {
+        "source": "/api/processAndSummarizeContent",
+        "function": "processAndSummarizeContent"
+      },
+       {
          "source": "**",
          "destination": "/index.html"
        }
